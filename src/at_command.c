@@ -357,17 +357,6 @@ int at_enqueue_initialization_simcom(struct cpvt* cpvt)
     DECLARE_AT_CMD(exunsol_init, "+EXUNSOL=\"SQ\",1");
     DECLARE_AT_CMD(clts_init, "+CLTS=1");
 
-    DECLARE_AT_CMD(ddet_0, "+DDET=0");
-    DECLARE_AT_CMD(ddet_1, "+DDET=1");
-
-    static const at_queue_cmd_t ddet_cmds[] = {
-        ATQ_CMD_DECLARE_STI(CMD_AT_DDET_0, ddet_0),
-        ATQ_CMD_DECLARE_STI(CMD_AT_DDET_1, ddet_1),
-    };
-
-    struct pvt* const pvt   = cpvt->pvt;
-    const unsigned int dtmf = CONF_SHARED(pvt, dtmf);
-
     const at_queue_cmd_t cmds[] = {
         ATQ_CMD_DECLARE_STI(CMD_AT_CCID, ccid),
         ATQ_CMD_DECLARE_STI(CMD_AT_CICCID, ciccid),
@@ -379,7 +368,7 @@ int at_enqueue_initialization_simcom(struct cpvt* cpvt)
         ATQ_CMD_DECLARE_STI(CMD_AT_AUTOCSQ_INIT, autocsq_init),
         ATQ_CMD_DECLARE_STI(CMD_AT_EXUNSOL_INIT, exunsol_init),
         ATQ_CMD_DECLARE_STI(CMD_AT_CLTS_INIT, clts_init),
-        ddet_cmds[dtmf ? 1 : 0],
+        /* SIM7600E-H rejects both AT+DDET=0 and AT+DDET=1 outside an active call. */
         ATQ_CMD_DECLARE_ST(CMD_AT_FINAL, at),
     };
 

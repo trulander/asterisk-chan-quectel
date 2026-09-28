@@ -10,6 +10,10 @@ Some Linux USB serial drivers do not implement `TIOCGEXCL` or `TIOCEXCL` and ret
 This permits serial-PCM SIM7600 devices to initialize without weakening single-process
 access to their AT or audio tty.
 
+SIM7600E-H also rejects the driver's `AT+DDET` initialization command. This fork does
+not configure in-modem receive DTMF detection for SimCOM; outbound DTMF continues to use
+`AT+VTS`. Receive DTMF is enabled only after a separate active-call qualification.
+
 ----
 
 Supported modules:
