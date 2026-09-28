@@ -224,7 +224,7 @@ static void pvt_start(struct pvt* const pvt)
 
     pvt_monitor_stop(pvt);
 
-    ast_verb(3, "[%s] Trying to connect data port %s...\n", PVT_ID(pvt), CONF_UNIQ(pvt, alsadev));
+    ast_verb(3, "[%s] Trying to connect data port %s...\n", PVT_ID(pvt), CONF_UNIQ(pvt, data_tty));
     pvt->data_fd = tty_open(CONF_UNIQ(pvt, data_tty), (CONF_UNIQ(pvt, uac) == TRIBOOL_NONE) ? 2 : 0);
     if (pvt->data_fd < 0) {
         return;

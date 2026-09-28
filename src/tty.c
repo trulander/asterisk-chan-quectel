@@ -29,7 +29,9 @@ void tty_close_lck(const char* dev, int fd, int exclusive, int flck)
     if (exclusive) {
         if (ioctl(fd, TIOCNXCL) < 0) {
             const int errno_save = errno;
-            ast_log(LOG_WARNING, "[TTY] Unable to disable exlusive mode for %s: %s\n", dev, strerror(errno_save));
+            if (errno_save != ENOTTY && errno_save != EINVAL) {
+                ast_log(LOG_WARNING, "[TTY] Unable to disable exlusive mode for %s: %s\n", dev, strerror(errno_save));
+            }
         }
     }
 
@@ -57,14 +59,16 @@ int tty_open(const char* dev, int typ)
     }
 
     int locking_status = 0;
+    int exclusive = 0;
     if (ioctl(fd, TIOCGEXCL, &locking_status) < 0) {
         const int errno_save = errno;
-        tty_close_lck(dev, fd, 0, 0);
-        ast_log(LOG_WARNING, "[TTY] Unable to get locking status for %s: %s\n", dev, strerror(errno_save));
-        return -1;
-    }
-
-    if (locking_status) {
+        if (errno_save != ENOTTY && errno_save != EINVAL) {
+            tty_close_lck(dev, fd, 0, 0);
+            ast_log(LOG_WARNING, "[TTY] Unable to get locking status for %s: %s\n", dev, strerror(errno_save));
+            return -1;
+        }
+        ast_log(LOG_NOTICE, "[TTY] %s does not support TIOCGEXCL; using flock fallback\n", dev);
+    } else if (locking_status) {
         tty_close_lck(dev, fd, 0, 0);
         ast_verb(1, "Device %s locked.\n", dev);
         return -1;
@@ -72,14 +76,19 @@ int tty_open(const char* dev, int typ)
 
     if (ioctl(fd, TIOCEXCL) < 0) {
         const int errno_save = errno;
-        tty_close_lck(dev, fd, 0, 0);
-        ast_log(LOG_WARNING, "[TTY] Unable to put %s into exclusive mode: %s\n", dev, strerror(errno_save));
-        return -1;
+        if (errno_save != ENOTTY && errno_save != EINVAL) {
+            tty_close_lck(dev, fd, 0, 0);
+            ast_log(LOG_WARNING, "[TTY] Unable to put %s into exclusive mode: %s\n", dev, strerror(errno_save));
+            return -1;
+        }
+        ast_log(LOG_NOTICE, "[TTY] %s does not support TIOCEXCL; flock remains the exclusive lock\n", dev);
+    } else {
+        exclusive = 1;
     }
 
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
         const int errno_save = errno;
-        tty_close_lck(dev, fd, 1, 0);
+        tty_close_lck(dev, fd, exclusive, 0);
         ast_log(LOG_WARNING, "[TTY] Unable to flock %s: %s\n", dev, strerror(errno_save));
         return -1;
     }
@@ -87,14 +96,14 @@ int tty_open(const char* dev, int typ)
     const int flags = fcntl(fd, F_GETFD);
     if (flags == -1 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
         const int errno_save = errno;
-        tty_close_lck(dev, fd, 1, 1);
+        tty_close_lck(dev, fd, exclusive, 1);
         ast_log(LOG_WARNING, "[TTY] fcntl(F_GETFD/F_SETFD) failed for %s: %s\n", dev, strerror(errno_save));
         return -1;
     }
 
     if (tcgetattr(fd, &term_attr)) {
         const int errno_save = errno;
-        tty_close_lck(dev, fd, 1, 1);
+        tty_close_lck(dev, fd, exclusive, 1);
         ast_log(LOG_WARNING, "[TTY] tcgetattr() failed for %s: %s\n", dev, strerror(errno_save));
         return -1;
     }

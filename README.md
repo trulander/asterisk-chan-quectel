@@ -2,6 +2,14 @@
 
 See original [README](//github.com/IchthysMaranatha/asterisk-chan-quectel/blob/master/README.md) of this project.
 
+## SIM7600 ttyUSB locking compatibility
+
+Some Linux USB serial drivers do not implement `TIOCGEXCL` or `TIOCEXCL` and return
+`ENOTTY`. The driver logs this condition and falls back to the mandatory non-blocking
+`flock(LOCK_EX)` lock. Permission, busy-port, and other locking errors remain fatal.
+This permits serial-PCM SIM7600 devices to initialize without weakening single-process
+access to their AT or audio tty.
+
 ----
 
 Supported modules:
