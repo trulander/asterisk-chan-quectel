@@ -807,6 +807,15 @@ int at_enqueue_dial(struct cpvt* cpvt, const char* number, int clir)
         cnt++;
     }
 
+    if (pvt->is_simcom && CONF_UNIQ(pvt, uac) == TRIBOOL_FALSE && pvt->has_voice) {
+        /* SIM7600 serial-PCM: deactivate the in-modem PCM/audio stream before dialing so
+         * the audio path is known-clean at call start and release never leaves it stuck
+         * (mirrors the biaide serial-PCM model). Safe: a failure here is non-fatal. */
+        DECLARE_AT_CMD(cpcmreg0, "+CPCMREG=0");
+        ATQ_CMD_INIT_ST(cmds[cnt], CMD_AT_CPCMREG0, AT_CMD(cpcmreg0));
+        cnt++;
+    }
+
     if (at_fill_generic_cmd(&cmds[cnt], AT_CMD(atd), number)) {
         ast_free(tmp);
         chan_quectel_err = E_CMD_FORMAT;
@@ -854,6 +863,16 @@ int at_enqueue_answer(struct cpvt* cpvt)
             ast_log(LOG_ERROR, "[%s] Request answer for call idx %d with state '%s'\n", PVT_ID(cpvt->pvt), cpvt->call_idx, call_state2str(cpvt->state));
             chan_quectel_err = E_UNKNOWN;
             return -1;
+    }
+
+    if (cpvt->state == CALL_STATE_INCOMING && cpvt->pvt->is_simcom && CONF_UNIQ(cpvt->pvt, uac) == TRIBOOL_FALSE &&
+        cpvt->pvt->has_voice) {
+        /* SIM7600 serial-PCM: deactivate the in-modem PCM/audio stream before answering so
+         * the audio path is known-clean at call start (biaide serial-PCM model). */
+        if (at_enqueue_cpcmreg(cpvt, 0)) {
+            chan_quectel_err = E_QUEUE;
+            return -1;
+        }
     }
 
     if (at_fill_generic_cmd(&cmd, fmt, cpvt->call_idx)) {

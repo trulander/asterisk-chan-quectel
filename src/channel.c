@@ -293,11 +293,14 @@ static int channel_hangup(struct ast_channel* channel)
         ast_debug(1, "[%s] Hanging up call - idx:%d cause:%d needed:%d\n", PVT_ID(pvt), cpvt->call_idx, hangup_cause, need_hangup);
 
         if (need_hangup) {
+            ast_verb(3, "[%s] Local hangup call idx:%d cause:%d - sending hangup to modem (AT+CHUP/QHUP)\n", PVT_ID(pvt), cpvt->call_idx, hangup_cause);
             if (at_enqueue_hangup(cpvt, cpvt->call_idx, hangup_cause)) {
                 ast_log(LOG_ERROR, "[%s] Error adding AT+CHUP command to queue, call not terminated!\n", PVT_ID(pvt));
             } else {
                 CPVT_RESET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
             }
+        } else {
+            ast_verb(3, "[%s] Local hangup call idx:%d cause:%d - modem release already handled (need_hangup=0), no CHUP sent\n", PVT_ID(pvt), cpvt->call_idx, hangup_cause);
         }
 
         cpvt_call_disactivate(cpvt);
