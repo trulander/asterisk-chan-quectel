@@ -323,10 +323,10 @@ static void change_state(struct cpvt* const cpvt, struct pvt* const pvt, struct 
 
         case CALL_STATE_RELEASED:
             cpvt_call_disactivate(cpvt);
-            /* from +CEND, restart or disconnect */
-            /* drop channel -> cpvt reference */
-            ast_channel_tech_pvt_set(channel, NULL);
-            cpvt_free(cpvt);
+            /* The remote GSM side already released this call. Keep cpvt attached
+             * until channel_hangup() owns its final cleanup; otherwise an AT-reader
+             * thread can free it while Asterisk still accesses tech_pvt. */
+            CPVT_RESET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
             if (channel_enqueue_hangup(channel, cause)) {
                 ast_log(LOG_ERROR, "[%s] Error queueing hangup...\n", PVT_ID(pvt));
             }

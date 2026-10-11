@@ -307,6 +307,11 @@ static int channel_hangup(struct ast_channel* channel)
 
         /* drop cpvt->channel reference */
         cpvt->channel = NULL;
+        if (cpvt->state == CALL_STATE_RELEASED) {
+            /* Remote release was queued by cpvt_change_state(); the hangup
+             * callback is now the sole owner of the final cpvt cleanup. */
+            cpvt_free(cpvt);
+        }
     }
 
     /* drop channel -> cpvt reference */
