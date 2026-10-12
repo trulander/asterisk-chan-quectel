@@ -285,87 +285,6 @@ static void mt_rfc3339_now(char* out, size_t len)
     }
 }
 
-/*!
- * \brief Build a message/cpim (RFC 3862) body carrying the IMDN request
- * headers (RFC 5438) so the Linphone client auto-sends a delivery receipt
- * back to us. Every line is CRLF terminated; the CPIM Content-length is the
- * byte length of the SMS text (not of the whole message).
- *
- * \param from_num sender number (may include '+'; used inside <sip:...>)
- * \param phone_user SIP user of the recipient (from sms_sip_to)
- * \param domain host part of sms_sip_to
- * \param mid our mt_queue message id (IMDN correlation secret, no @domain)
- * \param msg plain SMS text
- * \param buf output buffer (NUL terminated on return)
- * \param len size of \a buf
- * \retval 0 success, -1 when the body had to be truncated (logged)
- */
-static int mt_build_cpim(const char* from_num, const char* phone_user, const char* domain, const char* mid, const char* msg, char* buf, size_t len)
-{
-    char dt[64];
-    size_t pos = 0;
-    int truncated = 0;
-
-#define MT_CPIM_APPEND(fmt, ...)                                                           \
-    do {                                                                                   \
-        const int wr = snprintf(buf + pos, len > pos ? len - pos : 0, fmt, ##__VA_ARGS__); \
-        if (wr < 0 || (size_t)wr >= (len > pos ? len - pos : 0)) {                         \
-            truncated = 1;                                                                  \
-            break;                                                                          \
-        }                                                                                   \
-        pos += (size_t)wr;                                                                  \
-    } while (0)
-
-    mt_rfc3339_now(dt, sizeof(dt));
-
-    MT_CPIM_APPEND("From: <sip:%s@%s>\r\n", S_OR(from_num, ""), S_OR(domain, ""));
-    if (!truncated) {
-        MT_CPIM_APPEND("To: <sip:%s@%s>\r\n", S_OR(phone_user, ""), S_OR(domain, ""));
-    }
-    if (!truncated) {
-        MT_CPIM_APPEND("DateTime: %s\r\n", S_OR(dt, ""));
-    }
-    if (!truncated) {
-        MT_CPIM_APPEND("NS: urn:ietf:params:imdn\r\n");
-    }
-    if (!truncated) {
-        MT_CPIM_APPEND("imdn.Message-ID: %s\r\n", S_OR(mid, ""));
-    }
-    if (!truncated) {
-        MT_CPIM_APPEND("imdn.Disposition-Notification: positive-delivery, negative-delivery\r\n");
-    }
-    if (!truncated) {
-        MT_CPIM_APPEND("Content-type: text/plain; charset=UTF-8\r\n");
-    }
-    if (!truncated) {
-        MT_CPIM_APPEND("Content-length: %d\r\n", (int)strlen(S_OR(msg, "")));
-    }
-    if (!truncated) {
-        MT_CPIM_APPEND("\r\n");
-    }
-    if (!truncated) {
-        /* body: keep as much as fits, NUL-terminated */
-        const size_t avail = len - pos;
-        const char* const text = S_OR(msg, "");
-        const size_t mlen = strlen(text);
-        size_t copy = mlen;
-        if (copy + 1 > avail) {
-            copy = avail - 1;
-            truncated = 1;
-        }
-        if (mlen) {
-            memcpy(buf + pos, text, copy);
-        }
-        pos += copy;
-        buf[pos] = '\0';
-    }
-#undef MT_CPIM_APPEND
-
-    if (truncated) {
-        ast_log(LOG_WARNING, "mt: CPIM body truncated to %zu bytes (mid=%s)\n", pos, S_OR(mid, ""));
-    }
-    return truncated ? -1 : 0;
-}
 
 /*!
  * \brief Build and send one MESSAGE for a mt_queue row.
@@ -454,23 +373,14 @@ static void mt_send_row(const struct smsdb_mt_row* row)
         ast_sip_add_header(tdata, "Message-ID", msgid_hdr);
     }
 
-    /* Wrap the SMS in message/cpim (RFC 3862) with imdn.Message-ID and
-     * imdn.Disposition-Notification (RFC 5438): the Linphone client then
-     * auto-sends a delivered IMDN receipt back, which we correlate by mid. */
-    char cpim[16384];
-    char phone_user[DEVNAMELEN];
-    const char* const puser = mt_sip_to_user(sip_to, phone_user, sizeof(phone_user));
-    if (ast_strlen_zero(puser)) {
-        pjsip_tx_data_dec_ref(tdata);
-        mt_send_fail(&cur, "sms_sip_to has no user part for CPIM To");
-        return;
-    }
-    mt_build_cpim(cur.from_num, puser, domain, cur.mid, cur.msg, cpim, sizeof(cpim));
-
+    /* Plain text body (known-good path): message/cpim was rejected by the
+     * receiving client (488) and made it auto-echo IMDN receipts back, which
+     * Asterisk's res_pjsip_messaging rejects with 415. The phone accepts and
+     * delivers text/plain; Flexisip answers the terminal 200 when online. */
     struct ast_sip_body body = {
-        .type      = "message",
-        .subtype   = "cpim",
-        .body_text = cpim,
+        .type      = "text",
+        .subtype   = "plain",
+        .body_text = cur.msg,
     };
     ast_sip_add_body(tdata, &body);
     if (!tdata->msg->body) {
