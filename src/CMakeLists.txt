@@ -40,9 +40,31 @@ target_link_libraries(asterisk-chan-quectel PRIVATE
     Iconv::Iconv
 )
 
-target_include_directories(asterisk-chan-quectel PRIVATE
-    ${CMAKE_BINARY_DIR}/generated
-)
+# Locate the Asterisk include directory (used to reach the bundled pjproject
+# headers needed by res_pjsip.h). The builder sets CMAKE_INCLUDE_PATH to the
+# Asterisk source 'include' dir, so find_path() resolves it here.
+find_path(MT_AST_INCLUDE_DIR NAMES asterisk/autoconfig.h)
+
+set(MT_PJPROJECT_SOURCE_DIR "${MT_AST_INCLUDE_DIR}/../third-party/pjproject/source")
+
+if(MT_AST_INCLUDE_DIR AND EXISTS "${MT_PJPROJECT_SOURCE_DIR}/pjsip/include/pjsip.h")
+    target_include_directories(asterisk-chan-quectel PRIVATE
+        ${CMAKE_BINARY_DIR}/generated
+        ${MT_PJPROJECT_SOURCE_DIR}/pjsip/include
+        ${MT_PJPROJECT_SOURCE_DIR}/pjlib/include
+        ${MT_PJPROJECT_SOURCE_DIR}/pjlib-util/include
+        ${MT_PJPROJECT_SOURCE_DIR}/pjmedia/include
+        ${MT_PJPROJECT_SOURCE_DIR}/pjnath/include
+    )
+else()
+    # mt_task.c includes <asterisk/res_pjsip.h> which needs the bundled
+    # pjproject headers; without them that file cannot be built. Still allow
+    # the rest of the driver to compile by keeping the generated dir on the
+    # include path.
+    target_include_directories(asterisk-chan-quectel PRIVATE
+        ${CMAKE_BINARY_DIR}/generated
+    )
+endif()
 
 target_compile_definitions(asterisk-chan-quectel PRIVATE
     _GNU_SOURCE

@@ -39,7 +39,6 @@
 
 // ================================================================
 
-#define MT_CMD_KICK 1
 #define MT_CMD_STOP 2
 
 /* one per mid; lives for one MESSAGE transaction send */
@@ -224,7 +223,7 @@ static void mt_send_row(const struct smsdb_mt_row* row)
     char endpoint_name[DEVNAMELEN];
     char domain[128];
     char from_buf[256];
-    char msgid_hdr[192];
+    char msgid_hdr[320]; /* <mid>@<domain>: mid<=128 + '@' + domain<=128 fits */
     pjsip_tx_data* tdata = NULL;
     struct mt_msg_token* token;
     int res;
@@ -359,9 +358,10 @@ static void* mt_retry_threadproc(void* arg)
                 ast_log(LOG_ERROR, "mt: fail to read kick event - stopping retry thread\n");
                 break;
             }
-            if ((val & MT_CMD_STOP) == MT_CMD_STOP) {
-                break;
-            }
+            /* kick: fall through to process the queue on the next iteration;
+             * stop is noticed via the mt_task_started flag checked above and on
+             * the next loop iteration (mt_task_stop clears the flag before
+             * waking this thread). */
         }
         /* timeout or kick: loop and process */
     }
@@ -738,8 +738,13 @@ int mt_task_start(void)
         return -1;
     }
 
+    /* Set the flag before spawning threads so the retry thread cannot see it
+     * as 0 and exit immediately after creation. */
+    mt_task_started = 1;
+
     if (ast_pthread_create_background(&mt_retry_thread, NULL, mt_retry_threadproc, NULL) < 0) {
         ast_log(LOG_ERROR, "mt: cannot create retry thread\n");
+        mt_task_started = 0;
         eventfd_close(&mt_kick_fd);
         mt_retry_thread = AST_PTHREADT_NULL;
         return -1;
