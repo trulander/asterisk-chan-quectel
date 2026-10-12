@@ -301,14 +301,15 @@ static void mt_send_row(const struct smsdb_mt_row* row)
     ast_copy_string(token->mid, cur.mid, sizeof(token->mid));
     token->attempts = cur.attempts;
 
+    /* count before send so a synchronous callback cannot leave the counter stale */
+    __sync_add_and_fetch(&mt_inflight, 1);
     res = ast_sip_send_request(tdata, NULL, endpoint, token, mt_msg_response_callback);
     if (res) {
+        __sync_sub_and_fetch(&mt_inflight, 1);
         ao2_ref(token, -1);
         mt_send_fail(&cur, "send request failed");
         return;
     }
-
-    __sync_add_and_fetch(&mt_inflight, 1);
     /* success: the callback will finalize the row state */
 }
 
@@ -453,7 +454,7 @@ static int mt_html_out_cb(void* ctx, const struct smsdb_mt_out_row* row)
     mt_html_escape(buf, row->msg);
     ast_str_append(buf, 0, "</td><td>");
     mt_html_escape(buf, row->state);
-    ast_str_append(buf, 0, "</td><td>%s</td></tr>", row->srr_status > 0 ? "srr" : "");
+    ast_str_append(buf, 0, "</td><td>%d</td><td>%s</td></tr>", row->mr, row->srr_status > 0 ? "srr" : "");
     return 0;
 }
 
@@ -479,7 +480,7 @@ static void mt_web_html(int client_fd)
 
     ast_str_append(&buf, 0, "<h2>Outgoing (Android&rarr;SIM) &mdash; mt_out</h2>");
     ast_str_append(&buf, 0,
-                   "<table><tr><th>time</th><th>device</th><th>dst</th><th>msg</th><th>state</th><th>srr</th></tr>");
+                   "<table><tr><th>time</th><th>device</th><th>dst</th><th>msg</th><th>state</th><th>mr</th><th>srr</th></tr>");
     smsdb_mt_out_list(&ctx, mt_html_out_cb);
     ast_str_append(&buf, 0, "</table>");
 
@@ -520,6 +521,7 @@ static int mt_json_out_cb(void* ctx, const struct smsdb_mt_out_row* row)
     ast_json_object_set(j, "ts", ast_json_string_create(row->ts));
     ast_json_object_set(j, "state", ast_json_string_create(row->state));
     ast_json_object_set(j, "srr_status", ast_json_integer_create(row->srr_status));
+    ast_json_object_set(j, "mr", ast_json_integer_create(row->mr));
     ast_json_object_set(j, "created_at", ast_json_integer_create(row->created_at));
     ast_json_object_set(j, "updated_at", ast_json_integer_create(row->updated_at));
     ast_json_array_append(((struct mt_json_ctx*)ctx)->arr, j);

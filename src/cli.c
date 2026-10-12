@@ -446,7 +446,7 @@ static char* cli_sms_send(struct ast_cli_entry* e, int cmd, struct ast_cli_args*
         }
     }
 
-    const int res = send_sms(a->argv[3], "", a->argv[4], ast_str_buffer(buf), DEF_VALIDITY, DEF_REPORT);
+    const int res = send_sms(a->argv[3], "", a->argv[4], ast_str_buffer(buf), DEF_VALIDITY, DEF_REPORT, 0);
     ast_cli(a->fd, "[%s] %s\n", a->argv[3], res < 0 ? error2str(chan_quectel_err) : "SMS queued for send");
 
     return CLI_SUCCESS;

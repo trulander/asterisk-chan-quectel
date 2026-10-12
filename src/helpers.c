@@ -100,7 +100,7 @@ int send_ussd(const char* dev_name, const char* ussd)
 
 #/* */
 
-int send_sms(const char* const resource, const char* const sca, const char* const destination, const char* const message, int validity, int report)
+int send_sms(const char* const resource, const char* const sca, const char* const destination, const char* const message, int validity, int report, int mt_out_id)
 {
     if (!is_valid_phone_number(destination)) {
         chan_quectel_err = E_INVALID_PHONE_NUMBER;
@@ -113,7 +113,7 @@ int send_sms(const char* const resource, const char* const sca, const char* cons
         return -1;
     }
 
-    const int res = at_enqueue_sms(&pvt->sys_chan, sca, destination, message, validity, report);
+    const int res = at_enqueue_sms(&pvt->sys_chan, sca, destination, message, validity, report, mt_out_id);
     return res;
 }
 

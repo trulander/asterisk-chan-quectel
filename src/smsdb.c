@@ -101,10 +101,13 @@ DEFINE_SQL_STATEMENT(add_mt_out,
                      "INSERT INTO mt_out (device, dst, msg, ts, state) VALUES (?, ?, ?, ?, 'submitted_to_modem')")
 DEFINE_SQL_STATEMENT(set_mt_out,
                      "UPDATE mt_out SET state = ?, srr_status = ?, updated_at = strftime('%s') WHERE id = ?")
-DEFINE_SQL_STATEMENT(get_mt_out_by_key,
-                     "SELECT id FROM mt_out WHERE device = ? AND dst = ? AND state = 'submitted_to_modem' ORDER BY id DESC LIMIT 1")
+DEFINE_SQL_STATEMENT(set_mt_out_mr,
+                     "UPDATE mt_out SET mr = ?, updated_at = strftime('%s') WHERE id = ?")
+DEFINE_SQL_STATEMENT(get_mt_out_by_mr,
+                     "SELECT id FROM mt_out WHERE device = ? AND dst = ? AND mr = ? AND state IN ('submitted_to_modem', 'smsc_ok') "
+                     "ORDER BY id DESC LIMIT 1")
 DEFINE_SQL_STATEMENT(list_mt_out,
-                     "SELECT id, device, dst, msg, ts, state, srr_status, created_at, updated_at "
+                     "SELECT id, device, dst, msg, ts, state, srr_status, mr, created_at, updated_at "
                      "FROM mt_out ORDER BY created_at DESC, id DESC")
 
 static sqlite3* smsdb;
@@ -316,7 +319,7 @@ static int db_create(void)
     // TABLE: mt_out(device, created_at) - outgoing Android->SIM delivery status
     DEFINE_INTERNAL_SQL_STATEMENT(create_mt_out,
                                   "CREATE TABLE IF NOT EXISTS mt_out (id INTEGER PRIMARY KEY AUTOINCREMENT, device TEXT NOT NULL, dst TEXT NOT NULL,"
-                                  "msg TEXT NOT NULL, ts TEXT, state TEXT NOT NULL DEFAULT 'submitted_to_modem', srr_status INTEGER,"
+                                  "msg TEXT NOT NULL, ts TEXT, state TEXT NOT NULL DEFAULT 'submitted_to_modem', srr_status INTEGER, mr INTEGER,"
                                   "created_at INTEGER NOT NULL DEFAULT (strftime('%s')), updated_at INTEGER)")
     DEFINE_INTERNAL_SQL_STATEMENT(create_mt_out_index, "CREATE INDEX IF NOT EXISTS mt_out_dev ON mt_out(device, created_at)")
 
@@ -371,14 +374,15 @@ static int db_init_statements(void)
     INIT_VSTMT(list_mt_queue);
     INIT_VSTMT(add_mt_out);
     INIT_VSTMT(set_mt_out);
-    INIT_VSTMT(get_mt_out_by_key);
+    INIT_VSTMT(set_mt_out_mr);
+    INIT_VSTMT(get_mt_out_by_mr);
     INIT_VSTMT(list_mt_out);
 
     return get_incomingmsg_res || put_incomingmsg_res || del_incomingmsg_res || get_incomingmsg_cnt_res || put_outgoingref_res || set_outgoingref_res ||
            get_outgoingref_res || put_outgoingmsg_res || put_outgoingpart_res || del_outgoingmsg_res || del_outgoingpart_res || get_outgoingmsg_key_res ||
            get_outgoingpart_res || set_outgoingpart_res || cnt_outgoingpart_res || cnt_all_outgoingpart_res || get_outgoingmsg_res || get_all_status_res ||
            get_outgoingmsg_expired_res || put_mt_queue_res || get_mt_queue_res || set_mt_queue_res || pick_mt_queue_res || list_mt_queue_res || add_mt_out_res ||
-           set_mt_out_res || get_mt_out_by_key_res || list_mt_out_res;
+           set_mt_out_res || set_mt_out_mr_res || get_mt_out_by_mr_res || list_mt_out_res;
 }
 
 static void db_clean_statements(void)
@@ -411,7 +415,8 @@ static void db_clean_statements(void)
     CLEAN_STMT(list_mt_queue);
     CLEAN_STMT(add_mt_out);
     CLEAN_STMT(set_mt_out);
-    CLEAN_STMT(get_mt_out_by_key);
+    CLEAN_STMT(set_mt_out_mr);
+    CLEAN_STMT(get_mt_out_by_mr);
     CLEAN_STMT(list_mt_out);
 }
 
@@ -1127,8 +1132,9 @@ static void mt_out_row_fill(struct smsdb_mt_out_row* row, sqlite3_stmt* stmt)
     ast_copy_string(row->ts, S_OR(ts, ""), sizeof(row->ts));
     ast_copy_string(row->state, S_OR(state, ""), sizeof(row->state));
     row->srr_status = sqlite3_column_int(stmt, 6);
-    row->created_at = (long)sqlite3_column_int64(stmt, 7);
-    row->updated_at = (long)sqlite3_column_int64(stmt, 8);
+    row->mr         = sqlite3_column_int(stmt, 7);
+    row->created_at = (long)sqlite3_column_int64(stmt, 8);
+    row->updated_at = (long)sqlite3_column_int64(stmt, 9);
 }
 
 static int bind_text_or_null(sqlite3_stmt* stmt, int colno, const char* text)
@@ -1378,36 +1384,66 @@ int smsdb_mt_out_set_state(int id, const char* state, int srr_status)
     return 0;
 }
 
-int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id)
+int smsdb_mt_out_set_mr(int id, int mr)
 {
-    /* mt_out has no MR column (per fixed schema), so the report is matched to the
-     * newest still-submitted row for (device, dst). The MR is kept for logging. */
-    if (ast_strlen_zero(device) || ast_strlen_zero(dst) || !id) {
+    if (id <= 0 || mr < 0) {
         return -1;
     }
-
-    (void)mr;
 
     int res;
 
     SCOPED_DB(smsdb);
-    SCOPED_STMT(get_mt_out_by_key);
+    SCOPED_STMT(set_mt_out_mr);
 
-    if ((res = sqlite3_bind_text(get_mt_out_by_key, 1, device, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+    if ((res = sqlite3_bind_int(set_mt_out_mr, 1, mr)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind mr to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_int(set_mt_out_mr, 2, id)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind id to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    if ((res = sqlite3_step(set_mt_out_mr)) != SQLITE_DONE) {
+        ast_log(LOG_WARNING, "Couldn't execute statement: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    return 0;
+}
+
+int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id)
+{
+    /* The mt_out row is stamped with the modem MR (refid) at send time, so the
+     * status report is matched precisely by (device, dst, mr). */
+    if (ast_strlen_zero(device) || ast_strlen_zero(dst) || mr < 0 || !id) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(get_mt_out_by_mr);
+
+    if ((res = sqlite3_bind_text(get_mt_out_by_mr, 1, device, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
         ast_log(LOG_WARNING, "Couldn't bind device to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
         return -1;
     }
-    if ((res = sqlite3_bind_text(get_mt_out_by_key, 2, dst, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+    if ((res = sqlite3_bind_text(get_mt_out_by_mr, 2, dst, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
         ast_log(LOG_WARNING, "Couldn't bind dst to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
         return -1;
     }
+    if ((res = sqlite3_bind_int(get_mt_out_by_mr, 3, mr)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind mr to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
 
-    res = sqlite3_step(get_mt_out_by_key);
+    res = sqlite3_step(get_mt_out_by_mr);
     if (res != SQLITE_ROW) {
         return -1;
     }
 
-    *id = sqlite3_column_int(get_mt_out_by_key, 0);
+    *id = sqlite3_column_int(get_mt_out_by_mr, 0);
     return 0;
 }
 

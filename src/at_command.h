@@ -141,7 +141,7 @@ int at_enqueue_ping(struct cpvt* cpvt);
 int at_enqueue_ping_taskproc(void*);
 int at_enqueue_cspn_cops(struct cpvt* cpvt);
 int at_enqueue_qspn_qnwinfo(struct cpvt* cpvt);
-int at_enqueue_sms(struct cpvt* cpvt, const char* sca, const char* destination, const char* msg, unsigned validity_min, int report_req);
+int at_enqueue_sms(struct cpvt* cpvt, const char* sca, const char* destination, const char* msg, unsigned validity_min, int report_req, int mt_out_id);
 int at_enqueue_ussd(struct cpvt* cpvt, const char* code, int gsm7);
 int at_enqueue_dtmf(struct cpvt* cpvt, char digit);
 int at_enqueue_set_ccwa(struct cpvt* cpvt, unsigned call_waiting);

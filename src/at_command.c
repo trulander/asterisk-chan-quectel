@@ -529,7 +529,7 @@ static int pdus_enqueue(struct cpvt* const cpvt, const pdu_part_t* const pdus, s
  * \param number -- the destination of the message
  * \param msg -- utf-8 encoded message
  */
-int at_enqueue_sms(struct cpvt* cpvt, const char* sca, const char* destination, const char* msg, unsigned validity_minutes, int report_req)
+int at_enqueue_sms(struct cpvt* cpvt, const char* sca, const char* destination, const char* msg, unsigned validity_minutes, int report_req, int mt_out_id)
 {
     struct pvt* const pvt = cpvt->pvt;
 
@@ -542,6 +542,12 @@ int at_enqueue_sms(struct cpvt* cpvt, const char* sca, const char* destination, 
     if (csmsref < 0) {
         chan_quectel_err = E_SMSDB;
         return -1;
+    }
+
+    /* stamp the modem MR (refid) onto the mt_out row so the GSM status report
+     * can be matched precisely by (device, dst, mr). */
+    if (mt_out_id > 0) {
+        smsdb_mt_out_set_mr(mt_out_id, csmsref);
     }
 
     RAII_VAR(pdu_part_t*, pdus, ast_calloc(sizeof(pdu_part_t), 255), ast_free);

@@ -38,6 +38,7 @@ struct smsdb_mt_out_row {
     char ts[64];
     char state[MT_STATE_LEN];
     int srr_status;
+    int mr; /*!< modem message reference (refid) stamped at send time */
     long created_at;
     long updated_at;
 };
@@ -64,6 +65,7 @@ int smsdb_mt_list(void* ctx, smsdb_mt_list_cb cb);
 /* MT out (outgoing Android -> SIM) */
 int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const char* ts);
 int smsdb_mt_out_set_state(int id, const char* state, int srr_status);
+int smsdb_mt_out_set_mr(int id, int mr);
 int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id);
 typedef int (*smsdb_mt_out_list_cb)(void* ctx, const struct smsdb_mt_out_row* row);
 int smsdb_mt_out_list(void* ctx, smsdb_mt_out_list_cb cb);
