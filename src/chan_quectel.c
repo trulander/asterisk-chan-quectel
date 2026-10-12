@@ -62,6 +62,7 @@
 #include "helpers.h"
 #include "monitor_thread.h"
 #include "msg_tech.h"
+#include "mt_task.h"
 #include "mutils.h" /* ARRAY_LEN() */
 #include "pcm.h"
 #include "smsdb.h"
@@ -1503,6 +1504,7 @@ static int public_state_init(struct public_state* state)
     msg_tech_register();
 #endif
     cli_register();
+    mt_task_start();
 
     return AST_MODULE_LOAD_SUCCESS;
 }
@@ -1527,6 +1529,7 @@ static void public_state_fini(struct public_state* const state)
     app_unregister();
 #endif
 
+    mt_task_stop();
     smsdb_atexit();
 
     dev_manager_stop(state);
@@ -1567,7 +1570,7 @@ static int reload_module()
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, MODULE_DESCRIPTION, .support_level = AST_MODULE_SUPPORT_EXTENDED, .load = load_module,
-                .unload = unload_module, .reload = reload_module, .load_pri = AST_MODPRI_CHANNEL_DRIVER, );
+                .unload = unload_module, .reload = reload_module, .load_pri = AST_MODPRI_CHANNEL_DRIVER, .requires = "res_pjsip");
 
 // AST_MODULE_INFO_STANDARD (ASTERISK_GPL_KEY, MODULE_DESCRIPTION);
 

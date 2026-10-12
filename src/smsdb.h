@@ -5,6 +5,43 @@
 #ifndef CHAN_QUECTEL_SMSDB_H_INCLUDED
 #define CHAN_QUECTEL_SMSDB_H_INCLUDED
 
+#include "dc_config.h" /* DEVNAMELEN */
+
+#define MT_MID_LEN 128
+#define MT_STATE_LEN 32
+#define MT_RESULT_LEN 256
+#define MT_MSG_LEN 4096
+
+/*! Incoming SMS MT queue row (SIM -> SIP/Flexisip) */
+struct smsdb_mt_row {
+    char device[DEVNAMELEN];
+    char mid[MT_MID_LEN];
+    char from_num[64];
+    char msg[MT_MSG_LEN];
+    char ts[64];
+    char state[MT_STATE_LEN];
+    int attempts;
+    int next_retry_at;
+    char last_result[MT_RESULT_LEN];
+    long created_at;
+    long sent_at;
+    long delivered_at;
+};
+
+/*! Outgoing SMS row (Android -> SIM)
+    MT = "Message Transfer" naming shared with mt_queue for the web UI */
+struct smsdb_mt_out_row {
+    int id;
+    char device[DEVNAMELEN];
+    char dst[64];
+    char msg[MT_MSG_LEN];
+    char ts[64];
+    char state[MT_STATE_LEN];
+    int srr_status;
+    long created_at;
+    long updated_at;
+};
+
 int smsdb_init();
 void smsdb_atexit();
 int smsdb_put(const char* id, const char* addr, int ref, int parts, int order, const char* msg, struct ast_str** out);
@@ -15,5 +52,20 @@ int smsdb_outgoing_part_put(int uid, int refid, struct ast_str** dst, struct ast
 int smsdb_outgoing_part_status(const char* id, const char* addr, int mr, int st, int* status_all);
 int smsdb_outgoing_purge_one(int* uid, struct ast_str** dst, struct ast_str** msg);
 int smsdb_vacuum_into(const char* backup_file);
+
+/* MT queue (incoming SIM -> SIP) */
+int smsdb_mt_put(const char* device, const char* mid, const char* from_num, const char* msg, const char* ts);
+int smsdb_mt_get(const char* mid, struct smsdb_mt_row* row);
+int smsdb_mt_set_result(const char* mid, const char* state, int attempts, int next_retry_at, const char* last_result, int sent_at, int delivered_at);
+int smsdb_mt_pick_retry(long now, int max_attempts, struct smsdb_mt_row* row);
+typedef int (*smsdb_mt_list_cb)(void* ctx, const struct smsdb_mt_row* row);
+int smsdb_mt_list(void* ctx, smsdb_mt_list_cb cb);
+
+/* MT out (outgoing Android -> SIM) */
+int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const char* ts);
+int smsdb_mt_out_set_state(int id, const char* state, int srr_status);
+int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id);
+typedef int (*smsdb_mt_out_list_cb)(void* ctx, const struct smsdb_mt_out_row* row);
+int smsdb_mt_out_list(void* ctx, smsdb_mt_out_list_cb cb);
 
 #endif

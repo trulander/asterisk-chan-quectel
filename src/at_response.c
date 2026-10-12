@@ -30,6 +30,7 @@
 #include "char_conv.h"
 #include "error.h"
 #include "helpers.h"
+#include "mt_task.h"
 #include "mutils.h" /* STRLEN() */
 #include "smsdb.h"
 
@@ -1620,6 +1621,16 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
         case PDUTYPE_MTI_SMS_STATUS_REPORT: {
             ast_verb(1, "[%s][SMS:%d] Got status report from %s and status code %d\n", PVT_ID(pvt), mr, ast_str_buffer(oa), st);
 
+            /* Update the MT outbound (Android->SIM) delivery status, beside the existing outgoing_part bookkeeping. */
+            {
+                int mt_out_id = -1;
+                if (!smsdb_mt_out_find_by_mr(PVT_ID(pvt), ast_str_buffer(oa), mr, &mt_out_id) && mt_out_id > 0) {
+                    const char* const mt_state = (st & 0x40) ? "failed" : (st == 0 ? "delivered_to_handset" : "smsc_ok");
+                    smsdb_mt_out_set_state(mt_out_id, mt_state, st);
+                    ast_verb(2, "[%s][SMS:%d] MT out #%d -> %s (srr=%d)\n", PVT_ID(pvt), mr, mt_out_id, mt_state, st);
+                }
+            }
+
             RAII_VAR(int*, status_report, ast_calloc(sizeof(int), 256), ast_free);
             if (!smsdb_outgoing_part_status(pvt->imsi, ast_str_buffer(oa), mr, st, status_report)) {
                 RAII_VAR(struct ast_json*, report, ast_json_object_create(), ast_json_unref);
@@ -1705,6 +1716,19 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
             } else {
                 ast_verb(1, "[%s][SMS:%d PARTS:%d TS:%s] Got empty message from %s\n", PVT_ID(pvt), (int)udh.ref, (int)udh.parts, ast_str_buffer(scts_str),
                          ast_str_buffer(oa));
+            }
+
+            /* MT delivery: queue the incoming SMS for SIP/Flexisip delivery (before Local channel) */
+            {
+                char mid[MT_MID_LEN];
+                mt_gen_mid(PVT_ID(pvt), mid, sizeof(mid));
+                if (smsdb_mt_put(PVT_ID(pvt), mid, ast_str_buffer(oa), ast_str_buffer(fullmsg), ast_str_buffer(scts_str))) {
+                    ast_log(LOG_WARNING, "[%s][SMS:%d] MT queue put failed (mid=%s)\n", PVT_ID(pvt), (int)udh.ref, mid);
+                } else {
+                    ast_verb(3, "[%s][SMS:%d] MT queued mid=%s from %s\n", PVT_ID(pvt), (int)udh.ref, mid, ast_str_buffer(oa));
+                    mt_kick();
+                }
+                ast_json_object_set(sms, "mid", ast_json_string_create(mid));
             }
 
             if (!channel_start_local_json(pvt, "sms", ast_str_buffer(oa), "SMS", sms) && CONF_SHARED(pvt, sms_autodelete) &&

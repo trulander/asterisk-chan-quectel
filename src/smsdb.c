@@ -79,6 +79,34 @@ DEFINE_SQL_STATEMENT(cnt_all_outgoingpart,
                      "FROM outgoing_msg m "
                      "WHERE m.uid = ?")
 
+// OPER: mt_queue (incoming SIM->SIP)
+DEFINE_SQL_STATEMENT(put_mt_queue,
+                     "INSERT OR IGNORE INTO mt_queue (device, mid, from_num, msg, ts, state) VALUES (?, ?, ?, ?, ?, 'new')")
+DEFINE_SQL_STATEMENT(get_mt_queue,
+                     "SELECT device, mid, from_num, msg, ts, state, attempts, next_retry_at, last_result, created_at, sent_at, delivered_at "
+                     "FROM mt_queue WHERE mid = ?")
+DEFINE_SQL_STATEMENT(set_mt_queue,
+                     "UPDATE mt_queue SET state = ?, attempts = ?, next_retry_at = ?, last_result = ?, sent_at = ?, delivered_at = ? "
+                     "WHERE mid = ?")
+DEFINE_SQL_STATEMENT(pick_mt_queue,
+                     "SELECT device, mid, from_num, msg, ts, state, attempts, next_retry_at, last_result, created_at, sent_at, delivered_at "
+                     "FROM mt_queue WHERE (state = 'new') OR (state = 'retrying' AND next_retry_at <= ? AND attempts < ?) "
+                     "ORDER BY created_at LIMIT 1")
+DEFINE_SQL_STATEMENT(list_mt_queue,
+                     "SELECT device, mid, from_num, msg, ts, state, attempts, next_retry_at, last_result, created_at, sent_at, delivered_at "
+                     "FROM mt_queue ORDER BY created_at DESC, ROWID DESC")
+
+// OPER: mt_out (outgoing Android->SIM)
+DEFINE_SQL_STATEMENT(add_mt_out,
+                     "INSERT INTO mt_out (device, dst, msg, ts, state) VALUES (?, ?, ?, ?, 'submitted_to_modem')")
+DEFINE_SQL_STATEMENT(set_mt_out,
+                     "UPDATE mt_out SET state = ?, srr_status = ?, updated_at = strftime('%s') WHERE id = ?")
+DEFINE_SQL_STATEMENT(get_mt_out_by_key,
+                     "SELECT id FROM mt_out WHERE device = ? AND dst = ? AND state = 'submitted_to_modem' ORDER BY id DESC LIMIT 1")
+DEFINE_SQL_STATEMENT(list_mt_out,
+                     "SELECT id, device, dst, msg, ts, state, srr_status, created_at, updated_at "
+                     "FROM mt_out ORDER BY created_at DESC, id DESC")
+
 static sqlite3* smsdb;
 
 static int set_ast_str(sqlite3_stmt* stmt, int colno, struct ast_str** str)
@@ -278,6 +306,20 @@ static int db_create(void)
                                   "CREATE TABLE IF NOT EXISTS outgoing_part (key VARCHAR(256), msg INTEGER, status INTEGER, PRIMARY KEY(key))")
     DEFINE_INTERNAL_SQL_STATEMENT(create_outgoingpart_index, "CREATE INDEX IF NOT EXISTS outgoing_part_msg ON outgoing_part(msg)")
 
+    // TABLE: mt_queue(device, mid) - incoming SIM->SIP delivery queue + history
+    DEFINE_INTERNAL_SQL_STATEMENT(create_mt_queue,
+                                  "CREATE TABLE IF NOT EXISTS mt_queue (device TEXT NOT NULL, mid TEXT PRIMARY KEY, from_num TEXT NOT NULL, msg TEXT NOT NULL,"
+                                  "ts TEXT, state TEXT NOT NULL DEFAULT 'new', attempts INTEGER NOT NULL DEFAULT 0, next_retry_at INTEGER NOT NULL DEFAULT 0,"
+                                  "last_result TEXT, created_at INTEGER NOT NULL DEFAULT (strftime('%s')), sent_at INTEGER, delivered_at INTEGER)")
+    DEFINE_INTERNAL_SQL_STATEMENT(create_mt_queue_index, "CREATE INDEX IF NOT EXISTS mt_queue_pending ON mt_queue(state, next_retry_at)")
+
+    // TABLE: mt_out(device, created_at) - outgoing Android->SIM delivery status
+    DEFINE_INTERNAL_SQL_STATEMENT(create_mt_out,
+                                  "CREATE TABLE IF NOT EXISTS mt_out (id INTEGER PRIMARY KEY AUTOINCREMENT, device TEXT NOT NULL, dst TEXT NOT NULL,"
+                                  "msg TEXT NOT NULL, ts TEXT, state TEXT NOT NULL DEFAULT 'submitted_to_modem', srr_status INTEGER,"
+                                  "created_at INTEGER NOT NULL DEFAULT (strftime('%s')), updated_at INTEGER)")
+    DEFINE_INTERNAL_SQL_STATEMENT(create_mt_out_index, "CREATE INDEX IF NOT EXISTS mt_out_dev ON mt_out(device, created_at)")
+
     SCOPED_DB(smsdb);
     SCOPED_TRANSACTION(dbtrans);
 
@@ -287,9 +329,13 @@ static int db_create(void)
     EXECUTE_VSTMT(create_outgoingref);
     EXECUTE_VSTMT(create_outgoingpart);
     EXECUTE_VSTMT(create_outgoingpart_index);
+    EXECUTE_VSTMT(create_mt_queue);
+    EXECUTE_VSTMT(create_mt_queue_index);
+    EXECUTE_VSTMT(create_mt_out);
+    EXECUTE_VSTMT(create_mt_out_index);
 
     return create_incomingmsg_res || create_incomingmsg_index_res || create_outgoingmsg_res || create_outgoingref_res || create_outgoingpart_res ||
-           create_outgoingpart_index_res;
+           create_outgoingpart_index_res || create_mt_queue_res || create_mt_queue_index_res || create_mt_out_res || create_mt_out_index_res;
 }
 
 static int db_init_statements(void)
@@ -318,11 +364,21 @@ static int db_init_statements(void)
     INIT_VSTMT(get_outgoingmsg);
     INIT_VSTMT(get_all_status);
     INIT_VSTMT(get_outgoingmsg_expired);
+    INIT_VSTMT(put_mt_queue);
+    INIT_VSTMT(get_mt_queue);
+    INIT_VSTMT(set_mt_queue);
+    INIT_VSTMT(pick_mt_queue);
+    INIT_VSTMT(list_mt_queue);
+    INIT_VSTMT(add_mt_out);
+    INIT_VSTMT(set_mt_out);
+    INIT_VSTMT(get_mt_out_by_key);
+    INIT_VSTMT(list_mt_out);
 
     return get_incomingmsg_res || put_incomingmsg_res || del_incomingmsg_res || get_incomingmsg_cnt_res || put_outgoingref_res || set_outgoingref_res ||
            get_outgoingref_res || put_outgoingmsg_res || put_outgoingpart_res || del_outgoingmsg_res || del_outgoingpart_res || get_outgoingmsg_key_res ||
            get_outgoingpart_res || set_outgoingpart_res || cnt_outgoingpart_res || cnt_all_outgoingpart_res || get_outgoingmsg_res || get_all_status_res ||
-           get_outgoingmsg_expired_res;
+           get_outgoingmsg_expired_res || put_mt_queue_res || get_mt_queue_res || set_mt_queue_res || pick_mt_queue_res || list_mt_queue_res || add_mt_out_res ||
+           set_mt_out_res || get_mt_out_by_key_res || list_mt_out_res;
 }
 
 static void db_clean_statements(void)
@@ -348,6 +404,15 @@ static void db_clean_statements(void)
     CLEAN_STMT(get_outgoingmsg);
     CLEAN_STMT(get_all_status);
     CLEAN_STMT(get_outgoingmsg_expired);
+    CLEAN_STMT(put_mt_queue);
+    CLEAN_STMT(get_mt_queue);
+    CLEAN_STMT(set_mt_queue);
+    CLEAN_STMT(pick_mt_queue);
+    CLEAN_STMT(list_mt_queue);
+    CLEAN_STMT(add_mt_out);
+    CLEAN_STMT(set_mt_out);
+    CLEAN_STMT(get_mt_out_by_key);
+    CLEAN_STMT(list_mt_out);
 }
 
 static int db_name_in_memory(const char* db)
@@ -1017,6 +1082,355 @@ int smsdb_outgoing_purge_one(int* uid, struct ast_str** dst, struct ast_str** ms
     }
 
     return 0;
+}
+
+// ================================================================
+// MT helpers (incoming SIM->SIP queue and outgoing Android->SIM status)
+// ================================================================
+
+static void mt_row_fill(struct smsdb_mt_row* row, sqlite3_stmt* stmt)
+{
+    const char* const device     = (const char*)sqlite3_column_text(stmt, 0);
+    const char* const mid        = (const char*)sqlite3_column_text(stmt, 1);
+    const char* const from_num   = (const char*)sqlite3_column_text(stmt, 2);
+    const char* const msg        = (const char*)sqlite3_column_text(stmt, 3);
+    const char* const ts         = (const char*)sqlite3_column_text(stmt, 4);
+    const char* const state      = (const char*)sqlite3_column_text(stmt, 5);
+    const char* const last_result = (const char*)sqlite3_column_text(stmt, 8);
+
+    ast_copy_string(row->device, S_OR(device, ""), sizeof(row->device));
+    ast_copy_string(row->mid, S_OR(mid, ""), sizeof(row->mid));
+    ast_copy_string(row->from_num, S_OR(from_num, ""), sizeof(row->from_num));
+    ast_copy_string(row->msg, S_OR(msg, ""), sizeof(row->msg));
+    ast_copy_string(row->ts, S_OR(ts, ""), sizeof(row->ts));
+    ast_copy_string(row->state, S_OR(state, ""), sizeof(row->state));
+    ast_copy_string(row->last_result, S_OR(last_result, ""), sizeof(row->last_result));
+    row->attempts       = sqlite3_column_int(stmt, 6);
+    row->next_retry_at  = sqlite3_column_int(stmt, 7);
+    row->created_at     = (long)sqlite3_column_int64(stmt, 9);
+    row->sent_at        = (long)sqlite3_column_int64(stmt, 10);
+    row->delivered_at   = (long)sqlite3_column_int64(stmt, 11);
+}
+
+static void mt_out_row_fill(struct smsdb_mt_out_row* row, sqlite3_stmt* stmt)
+{
+    const char* const device = (const char*)sqlite3_column_text(stmt, 1);
+    const char* const dst    = (const char*)sqlite3_column_text(stmt, 2);
+    const char* const msg    = (const char*)sqlite3_column_text(stmt, 3);
+    const char* const ts     = (const char*)sqlite3_column_text(stmt, 4);
+    const char* const state  = (const char*)sqlite3_column_text(stmt, 5);
+
+    row->id         = sqlite3_column_int(stmt, 0);
+    ast_copy_string(row->device, S_OR(device, ""), sizeof(row->device));
+    ast_copy_string(row->dst, S_OR(dst, ""), sizeof(row->dst));
+    ast_copy_string(row->msg, S_OR(msg, ""), sizeof(row->msg));
+    ast_copy_string(row->ts, S_OR(ts, ""), sizeof(row->ts));
+    ast_copy_string(row->state, S_OR(state, ""), sizeof(row->state));
+    row->srr_status = sqlite3_column_int(stmt, 6);
+    row->created_at = (long)sqlite3_column_int64(stmt, 7);
+    row->updated_at = (long)sqlite3_column_int64(stmt, 8);
+}
+
+static int bind_text_or_null(sqlite3_stmt* stmt, int colno, const char* text)
+{
+    if (ast_strlen_zero(text)) {
+        return sqlite3_bind_null(stmt, colno);
+    }
+    return sqlite3_bind_text(stmt, colno, text, -1, SQLITE_TRANSIENT);
+}
+
+static int bind_int_or_null(sqlite3_stmt* stmt, int colno, int val)
+{
+    if (val < 0) {
+        return sqlite3_bind_null(stmt, colno);
+    }
+    return sqlite3_bind_int(stmt, colno, val);
+}
+
+int smsdb_mt_put(const char* device, const char* mid, const char* from_num, const char* msg, const char* ts)
+{
+    if (ast_strlen_zero(device) || ast_strlen_zero(mid)) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(put_mt_queue);
+
+    if ((res = sqlite3_bind_text(put_mt_queue, 1, device, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind device to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_text(put_mt_queue, 2, mid, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind mid to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_text_or_null(put_mt_queue, 3, from_num)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind from_num to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_text_or_null(put_mt_queue, 4, msg)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind msg to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_text_or_null(put_mt_queue, 5, ts)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind ts to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    if ((res = sqlite3_step(put_mt_queue)) != SQLITE_DONE) {
+        ast_log(LOG_WARNING, "Couldn't execute statement: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    return 0;
+}
+
+int smsdb_mt_get(const char* mid, struct smsdb_mt_row* row)
+{
+    if (ast_strlen_zero(mid) || !row) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(get_mt_queue);
+
+    if ((res = sqlite3_bind_text(get_mt_queue, 1, mid, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind mid to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    if ((res = sqlite3_step(get_mt_queue)) != SQLITE_ROW) {
+        return -1;
+    }
+
+    mt_row_fill(row, get_mt_queue);
+    return 0;
+}
+
+int smsdb_mt_set_result(const char* mid, const char* state, int attempts, int next_retry_at, const char* last_result, int sent_at, int delivered_at)
+{
+    if (ast_strlen_zero(mid) || ast_strlen_zero(state)) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(set_mt_queue);
+
+    if ((res = sqlite3_bind_text(set_mt_queue, 1, state, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind state to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_int(set_mt_queue, 2, attempts)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind attempts to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_int(set_mt_queue, 3, next_retry_at)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind next_retry_at to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_text_or_null(set_mt_queue, 4, last_result)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind last_result to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_int_or_null(set_mt_queue, 5, sent_at)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind sent_at to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_int_or_null(set_mt_queue, 6, delivered_at)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind delivered_at to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_text(set_mt_queue, 7, mid, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind mid to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    if ((res = sqlite3_step(set_mt_queue)) != SQLITE_DONE) {
+        ast_log(LOG_WARNING, "Couldn't execute statement: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    return 0;
+}
+
+int smsdb_mt_pick_retry(long now, int max_attempts, struct smsdb_mt_row* row)
+{
+    if (!row || max_attempts < 0) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(pick_mt_queue);
+
+    if ((res = sqlite3_bind_int64(pick_mt_queue, 1, now)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind now to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_int(pick_mt_queue, 2, max_attempts)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind max_attempts to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    res = sqlite3_step(pick_mt_queue);
+    if (res == SQLITE_ROW) {
+        mt_row_fill(row, pick_mt_queue);
+        return 1;
+    }
+
+    return (res == SQLITE_DONE) ? 0 : -1;
+}
+
+int smsdb_mt_list(void* ctx, smsdb_mt_list_cb cb)
+{
+    if (!cb) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(list_mt_queue);
+
+    while ((res = sqlite3_step(list_mt_queue)) == SQLITE_ROW) {
+        struct smsdb_mt_row row;
+        mt_row_fill(&row, list_mt_queue);
+        if (cb(ctx, &row)) {
+            return 0;
+        }
+    }
+
+    return (res == SQLITE_DONE) ? 0 : -1;
+}
+
+int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const char* ts)
+{
+    if (ast_strlen_zero(device) || ast_strlen_zero(dst)) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(add_mt_out);
+
+    if ((res = sqlite3_bind_text(add_mt_out, 1, device, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind device to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_text(add_mt_out, 2, dst, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind dst to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_text_or_null(add_mt_out, 3, msg)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind msg to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_text_or_null(add_mt_out, 4, ts)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind ts to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    if ((res = sqlite3_step(add_mt_out)) != SQLITE_DONE) {
+        ast_log(LOG_WARNING, "Couldn't execute statement: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    return (int)sqlite3_last_insert_rowid(smsdb);
+}
+
+int smsdb_mt_out_set_state(int id, const char* state, int srr_status)
+{
+    if (id <= 0 || ast_strlen_zero(state)) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(set_mt_out);
+
+    if ((res = sqlite3_bind_text(set_mt_out, 1, state, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind state to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_int_or_null(set_mt_out, 2, srr_status)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind srr_status to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_int(set_mt_out, 3, id)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind id to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    if ((res = sqlite3_step(set_mt_out)) != SQLITE_DONE) {
+        ast_log(LOG_WARNING, "Couldn't execute statement: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    return 0;
+}
+
+int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id)
+{
+    /* mt_out has no MR column (per fixed schema), so the report is matched to the
+     * newest still-submitted row for (device, dst). The MR is kept for logging. */
+    if (ast_strlen_zero(device) || ast_strlen_zero(dst) || !id) {
+        return -1;
+    }
+
+    (void)mr;
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(get_mt_out_by_key);
+
+    if ((res = sqlite3_bind_text(get_mt_out_by_key, 1, device, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind device to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = sqlite3_bind_text(get_mt_out_by_key, 2, dst, -1, SQLITE_TRANSIENT)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind dst to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    res = sqlite3_step(get_mt_out_by_key);
+    if (res != SQLITE_ROW) {
+        return -1;
+    }
+
+    *id = sqlite3_column_int(get_mt_out_by_key, 0);
+    return 0;
+}
+
+int smsdb_mt_out_list(void* ctx, smsdb_mt_out_list_cb cb)
+{
+    if (!cb) {
+        return -1;
+    }
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(list_mt_out);
+
+    while ((res = sqlite3_step(list_mt_out)) == SQLITE_ROW) {
+        struct smsdb_mt_out_row row;
+        mt_out_row_fill(&row, list_mt_out);
+        if (cb(ctx, &row)) {
+            return 0;
+        }
+    }
+
+    return (res == SQLITE_DONE) ? 0 : -1;
 }
 
 int smsdb_vacuum_into(const char* backup_file)

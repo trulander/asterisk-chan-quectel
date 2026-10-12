@@ -15,6 +15,7 @@
 #include "chan_quectel.h" /* struct pvt */
 #include "error.h"
 #include "helpers.h" /* send_sms() ITEMS_OF() */
+#include "smsdb.h"
 
 struct ast_channel;
 
@@ -277,8 +278,15 @@ static int app_send_sms_exec(attribute_unused struct ast_channel* channel, const
         return -1;
     }
 
+    /* Record the outgoing SMS for MT delivery status tracking (honest state set by send_sms result below). */
+    const int mt_out_id = smsdb_mt_out_add(args.resource, args.number, args.message, "");
+
     if (send_sms(args.resource, "", args.number, args.message, parse_validity(args.validity), parse_report_flag(args.report))) {
         ast_log(LOG_ERROR, "[%s] %s\n", args.resource, error2str(chan_quectel_err));
+        /* The modem refused the message: do not leave it marked as submitted. */
+        if (mt_out_id > 0) {
+            smsdb_mt_out_set_state(mt_out_id, "failed", 0);
+        }
         return -1;
     }
 

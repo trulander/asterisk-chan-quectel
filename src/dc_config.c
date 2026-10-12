@@ -137,6 +137,8 @@ static int dc_uconfig_fill(struct ast_config* cfg, const char* cat, struct dc_uc
     const char* const alsadev    = ast_variable_retrieve(cfg, cat, "alsadev");
     const char* const uac_str    = ast_variable_retrieve(cfg, cat, "uac");
     const char* const slin16_str = ast_variable_retrieve(cfg, cat, "slin16");
+    const char* const sms_sip_to = ast_variable_retrieve(cfg, cat, "sms_sip_to");
+    const char* const sms_sip_endpoint = ast_variable_retrieve(cfg, cat, "sms_sip_endpoint");
 
     if (uac_str) {
         if (dc_str23stbool_ex(uac_str, &uac, "ext")) {
@@ -157,6 +159,8 @@ static int dc_uconfig_fill(struct ast_config* cfg, const char* cat, struct dc_uc
     ast_copy_string(config->id, cat, sizeof(config->id));
     ast_copy_string(config->data_tty, S_OR(data_tty, ""), sizeof(config->data_tty));
     ast_copy_string(config->audio_tty, S_OR(audio_tty, ""), sizeof(config->audio_tty));
+    ast_copy_string(config->sms_sip_to, S_OR(sms_sip_to, ""), sizeof(config->sms_sip_to));
+    ast_copy_string(config->sms_sip_endpoint, S_OR(sms_sip_endpoint, ""), sizeof(config->sms_sip_endpoint));
     config->uac = uac;
     switch (uac) {
         case TRIBOOL_FALSE:
@@ -287,7 +291,14 @@ void dc_gconfig_fill(struct ast_config* cfg, const char* cat, struct dc_gconfig*
     config->manager_interval = DEFAULT_MANAGER_INTERVAL;
     ast_copy_string(config->sms_db, DEFAULT_SMS_DB, sizeof(config->sms_db));
     ast_copy_string(config->sms_backup_db, DEFAULT_SMS_BACKUP_DB, sizeof(config->sms_backup_db));
-    config->sms_ttl = DEFAULT_SMS_TTL;
+    config->sms_ttl           = DEFAULT_SMS_TTL;
+    config->mt_retry_interval = 20;
+    config->mt_retry_base     = 30;
+    config->mt_retry_max_delay    = 3600;
+    config->mt_retry_max_attempts = 300;
+    config->mt_web_enabled        = 1;
+    ast_copy_string(config->mt_web_bind, "0.0.0.0", sizeof(config->mt_web_bind));
+    config->mt_web_port = 8899;
 
     const char* const stmp = ast_variable_retrieve(cfg, cat, "interval");
     if (stmp) {
@@ -318,6 +329,71 @@ void dc_gconfig_fill(struct ast_config* cfg, const char* cat, struct dc_gconfig*
             ast_log(LOG_NOTICE, "Error parsing 'smsttl' in general section, using default value %d\n", config->sms_ttl);
         } else {
             config->sms_ttl = tmp;
+        }
+    }
+
+    const char* const mtrip = ast_variable_retrieve(cfg, cat, "mt_retry_interval");
+    if (mtrip) {
+        errno          = 0;
+        const int tmp  = (int)strtol(mtrip, (char**)NULL, 10);
+        if (!tmp && errno == EINVAL) {
+            ast_log(LOG_NOTICE, "Error parsing 'mt_retry_interval' in general section, using default value %d\n", config->mt_retry_interval);
+        } else {
+            config->mt_retry_interval = tmp;
+        }
+    }
+
+    const char* const mtrbase = ast_variable_retrieve(cfg, cat, "mt_retry_base");
+    if (mtrbase) {
+        errno           = 0;
+        const int tmp   = (int)strtol(mtrbase, (char**)NULL, 10);
+        if (!tmp && errno == EINVAL) {
+            ast_log(LOG_NOTICE, "Error parsing 'mt_retry_base' in general section, using default value %d\n", config->mt_retry_base);
+        } else {
+            config->mt_retry_base = tmp;
+        }
+    }
+
+    const char* const mtmaxd = ast_variable_retrieve(cfg, cat, "mt_retry_max_delay");
+    if (mtmaxd) {
+        errno          = 0;
+        const int tmp  = (int)strtol(mtmaxd, (char**)NULL, 10);
+        if (!tmp && errno == EINVAL) {
+            ast_log(LOG_NOTICE, "Error parsing 'mt_retry_max_delay' in general section, using default value %d\n", config->mt_retry_max_delay);
+        } else {
+            config->mt_retry_max_delay = tmp;
+        }
+    }
+
+    const char* const mtrmax = ast_variable_retrieve(cfg, cat, "mt_retry_max_attempts");
+    if (mtrmax) {
+        errno          = 0;
+        const int tmp  = (int)strtol(mtrmax, (char**)NULL, 10);
+        if (!tmp && errno == EINVAL) {
+            ast_log(LOG_NOTICE, "Error parsing 'mt_retry_max_attempts' in general section, using default value %d\n", config->mt_retry_max_attempts);
+        } else {
+            config->mt_retry_max_attempts = tmp;
+        }
+    }
+
+    const char* const mtweb = ast_variable_retrieve(cfg, cat, "mt_web_enabled");
+    if (mtweb) {
+        config->mt_web_enabled = ast_true(mtweb) ? 1 : 0;
+    }
+
+    const char* const mtweb_bind = ast_variable_retrieve(cfg, cat, "mt_web_bind");
+    if (mtweb_bind) {
+        ast_copy_string(config->mt_web_bind, mtweb_bind, sizeof(config->mt_web_bind));
+    }
+
+    const char* const mtweb_port = ast_variable_retrieve(cfg, cat, "mt_web_port");
+    if (mtweb_port) {
+        errno          = 0;
+        const int tmp  = (int)strtol(mtweb_port, (char**)NULL, 10);
+        if (!tmp && errno == EINVAL) {
+            ast_log(LOG_NOTICE, "Error parsing 'mt_web_port' in general section, using default value %d\n", config->mt_web_port);
+        } else {
+            config->mt_web_port = tmp;
         }
     }
 }
@@ -353,7 +429,8 @@ static int dc_sconfig_compare(const struct dc_sconfig* const cfg1, const struct 
 static int dc_uconfig_compare(const struct dc_uconfig* const cfg1, const struct dc_uconfig* const cfg2)
 {
     return strcmp(cfg1->id, cfg2->id) || strcmp(cfg1->audio_tty, cfg2->audio_tty) || strcmp(cfg1->data_tty, cfg2->data_tty) ||
-           strcmp(cfg1->alsadev, cfg2->alsadev) || cfg1->uac != cfg2->uac || cfg1->slin16 != cfg2->slin16;
+           strcmp(cfg1->alsadev, cfg2->alsadev) || cfg1->uac != cfg2->uac || cfg1->slin16 != cfg2->slin16 ||
+           strcmp(cfg1->sms_sip_to, cfg2->sms_sip_to) || strcmp(cfg1->sms_sip_endpoint, cfg2->sms_sip_endpoint);
 }
 
 int pvt_config_compare(const struct pvt_config* const cfg1, const struct pvt_config* const cfg2)

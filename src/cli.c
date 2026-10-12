@@ -23,6 +23,7 @@
 #include "chan_quectel.h" /* devices */
 #include "error.h"
 #include "helpers.h" /* ARRAY_LEN() send_ccwa_set() send_reset() send_sms() send_ussd() */
+#include "mt_task.h"  /* mt_test_inject() */
 
 #define CLI_ALIASES(fn, cmdd, usage1, usage2)                                           \
     static char* fn##_quectel(struct ast_cli_entry* e, int cmd, struct ast_cli_args* a) \
@@ -671,6 +672,42 @@ static char* cli_sms_db_backup(struct ast_cli_entry* e, int cmd, struct ast_cli_
 
 CLI_ALIASES(cli_sms_db_backup, "sms db backup", "sms db backup", "Backup SMS database")
 
+static char* cli_sms_test_inject(struct ast_cli_entry* e, int cmd, struct ast_cli_args* a)
+{
+    static const ssize_t MSG_DEF_LEN = 160;
+
+    switch (cmd) {
+        case CLI_GENERATE:
+            if (a->pos == 3) {
+                return complete_device(a->word, a->n);
+            }
+            return NULL;
+    }
+
+    if (a->argc < 6) {
+        return CLI_SHOWUSAGE;
+    }
+
+    RAII_VAR(struct ast_str*, buf, ast_str_create(MSG_DEF_LEN), ast_free);
+
+    for (int i = 5; i < a->argc; ++i) {
+        if (i < (a->argc - 1)) {
+            ast_str_append(&buf, 0, "%s ", a->argv[i]);
+        } else {
+            ast_str_append(&buf, 0, "%s", a->argv[i]);
+        }
+    }
+
+    // no AT involved: only insert into mt_queue (state=new) and trigger MT delivery
+    const int res = mt_test_inject(a->argv[3], a->argv[4], ast_str_buffer(buf));
+    ast_cli(a->fd, "[%s] %s\n", a->argv[3], res < 0 ? "Could not enqueue test SMS" : "Test SMS queued for MT delivery");
+
+    return CLI_SUCCESS;
+}
+
+CLI_ALIASES(cli_sms_test_inject, "sms test-inject", "sms test-inject <device> <from> <message>",
+            "Inject a test incoming SMS into the MT delivery queue (no AT)")
+
 typedef const char* const* ast_cli_complete2_t;
 
 static char* cli_ccwa_set(struct ast_cli_entry* e, int cmd, struct ast_cli_args* a)
@@ -1090,6 +1127,7 @@ static struct ast_cli_entry cli[] = {
 	CLI_DEF_ENTRIES(cli_sms_direct_off,				"Receive messages indirectly")
 	CLI_DEF_ENTRIES(cli_sms_direct_auto,			"Receive messages in a way specified in configuration")
     CLI_DEF_ENTRIES(cli_sms_db_backup,			    "Backup SMS database")
+	CLI_DEF_ENTRIES(cli_sms_test_inject,			"Inject test incoming SMS into MT queue")
 
 	CLI_DEF_ENTRIES(cli_ccwa_set,				"Enable/Disable Call-Waiting")
 	CLI_DEF_ENTRIES(cli_reset,					"Reset modem")

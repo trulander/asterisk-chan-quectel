@@ -22,6 +22,7 @@ set(SRC_FILES
     mixbuffer.c
     monitor_thread.c
     msg_tech.c
+    mt_task.c
     pcm.c
     pdu.c
     ringbuffer.c

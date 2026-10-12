@@ -82,6 +82,14 @@ typedef struct dc_gconfig {
     char sms_db[PATHLEN];
     char sms_backup_db[PATHLEN];
     int sms_ttl;
+    /*!< MT (incoming SMS -> Flexisip/SIP) delivery settings */
+    int mt_retry_interval;     /*!< seconds between retry passes */
+    int mt_retry_base;         /*!< base backoff seconds (30 * 2^min(attempts,8)) */
+    int mt_retry_max_delay;    /*!< maximum backoff delay in seconds */
+    int mt_retry_max_attempts; /*!< stop retrying after this many attempts */
+    int mt_web_enabled;        /*!< mini HTTP status page enabled */
+    char mt_web_bind[64];      /*!< bind address of the mini HTTP page */
+    int mt_web_port;           /*!< TCP port of the mini HTTP page */
 } dc_gconfig_t;
 
 /* Local required (unique) settings */
@@ -93,6 +101,10 @@ typedef struct dc_uconfig {
     char alsadev[DEVNAMELEN];   /*!< ALSA audio device name */
     tristate_bool_t uac;        /*!< handle audio by audio device (UAC) */
     unsigned int slin16:1;      /*!< SLIN16 audio format */
+    /*!< SIP destination for incoming SMS MT delivery (e.g. sip:1001@sipsis.keblog.ru) */
+    char sms_sip_to[PATHLEN];
+    /*!< pjsip endpoint used to deliver incoming SMS MT (e.g. flexisip-outbound) */
+    char sms_sip_endpoint[DEVNAMELEN];
 } dc_uconfig_t;
 
 /* all Config settings join in one place */
