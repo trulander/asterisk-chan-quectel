@@ -11,6 +11,7 @@
 #define MT_STATE_LEN 32
 #define MT_RESULT_LEN 256
 #define MT_MSG_LEN 4096
+#define MT_IMDN_ID_LEN 256
 
 /*! Incoming SMS MT queue row (SIM -> SIP/Flexisip) */
 struct smsdb_mt_row {
@@ -39,6 +40,7 @@ struct smsdb_mt_out_row {
     char state[MT_STATE_LEN];
     int srr_status;
     int mr; /*!< modem message reference (refid) stamped at send time */
+    char imdn_id[MT_IMDN_ID_LEN]; /*!< IMDN id of the MO message (SIP Call-ID), for delivery receipts */
     long created_at;
     long updated_at;
 };
@@ -63,10 +65,11 @@ typedef int (*smsdb_mt_list_cb)(void* ctx, const struct smsdb_mt_row* row);
 int smsdb_mt_list(void* ctx, smsdb_mt_list_cb cb);
 
 /* MT out (outgoing Android -> SIM) */
-int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const char* ts);
+int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const char* ts, const char* imdn_id);
 int smsdb_mt_out_set_state(int id, const char* state, int srr_status);
 int smsdb_mt_out_set_mr(int id, int mr);
 int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id);
+int smsdb_mt_out_get_imdn_id(int id, char* out, size_t len);
 typedef int (*smsdb_mt_out_list_cb)(void* ctx, const struct smsdb_mt_out_row* row);
 int smsdb_mt_out_list(void* ctx, smsdb_mt_out_list_cb cb);
 

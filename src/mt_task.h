@@ -21,5 +21,7 @@ void mt_kick(void);
 void mt_gen_mid(const char* device, char* mid, size_t len);
 /* Test hook: insert an "incoming" SMS into mt_queue (state=new) and kick. No AT involved. */
 int mt_test_inject(const char* device, const char* from, const char* msg);
+/* Send a fire-and-forget RFC 5438 delivery notification for an outgoing SMS. */
+void mt_send_imdn_receipt(const char* device, const char* imdn_id, const char* to_gsm_node_hint, const char* state);
 
 #endif /* CHAN_QUECTEL_MT_TASK_H_INCLUDED */

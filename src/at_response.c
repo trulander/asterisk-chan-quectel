@@ -1628,6 +1628,13 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
                     const char* const mt_state = (st & 0x40) ? "failed" : (st == 0 ? "delivered_to_handset" : "smsc_ok");
                     smsdb_mt_out_set_state(mt_out_id, mt_state, st);
                     ast_log(LOG_NOTICE, "[%s] MT: outgoing SMS mt_out #%d -> %s (srr=%d)\n", PVT_ID(pvt), mt_out_id, mt_state, st);
+
+                    /* If the MO message carried an IMDN id (Call-ID), notify the
+                     * phone (RFC 5438 receipt) about the final modem status. */
+                    char imdn_id[512];
+                    if (smsdb_mt_out_get_imdn_id(mt_out_id, imdn_id, sizeof(imdn_id)) == 0 && !ast_strlen_zero(imdn_id)) {
+                        mt_send_imdn_receipt(PVT_ID(pvt), imdn_id, ast_str_buffer(oa), mt_state);
+                    }
                 }
             }
 

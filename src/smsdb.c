@@ -98,7 +98,7 @@ DEFINE_SQL_STATEMENT(list_mt_queue,
 
 // OPER: mt_out (outgoing Android->SIM)
 DEFINE_SQL_STATEMENT(add_mt_out,
-                     "INSERT INTO mt_out (device, dst, msg, ts, state) VALUES (?, ?, ?, ?, 'submitted_to_modem')")
+                     "INSERT INTO mt_out (device, dst, msg, ts, imdn_id, state) VALUES (?, ?, ?, ?, ?, 'submitted_to_modem')")
 DEFINE_SQL_STATEMENT(set_mt_out,
                      "UPDATE mt_out SET state = ?, srr_status = ?, updated_at = strftime('%s') WHERE id = ?")
 DEFINE_SQL_STATEMENT(set_mt_out_mr,
@@ -106,8 +106,9 @@ DEFINE_SQL_STATEMENT(set_mt_out_mr,
 DEFINE_SQL_STATEMENT(get_mt_out_by_mr,
                      "SELECT id FROM mt_out WHERE device = ? AND dst = ? AND mr = ? AND state IN ('submitted_to_modem', 'smsc_ok') "
                      "ORDER BY id DESC LIMIT 1")
+DEFINE_SQL_STATEMENT(get_mt_out_imdn_id, "SELECT imdn_id FROM mt_out WHERE id = ?")
 DEFINE_SQL_STATEMENT(list_mt_out,
-                     "SELECT id, device, dst, msg, ts, state, srr_status, mr, created_at, updated_at "
+                     "SELECT id, device, dst, msg, ts, state, srr_status, mr, imdn_id, created_at, updated_at "
                      "FROM mt_out ORDER BY created_at DESC, id DESC")
 
 static sqlite3* smsdb;
@@ -320,8 +321,9 @@ static int db_create(void)
     DEFINE_INTERNAL_SQL_STATEMENT(create_mt_out,
                                   "CREATE TABLE IF NOT EXISTS mt_out (id INTEGER PRIMARY KEY AUTOINCREMENT, device TEXT NOT NULL, dst TEXT NOT NULL,"
                                   "msg TEXT NOT NULL, ts TEXT, state TEXT NOT NULL DEFAULT 'submitted_to_modem', srr_status INTEGER, mr INTEGER,"
-                                  "created_at INTEGER NOT NULL DEFAULT (strftime('%s')), updated_at INTEGER)")
+                                  "imdn_id TEXT, created_at INTEGER NOT NULL DEFAULT (strftime('%s')), updated_at INTEGER)")
     DEFINE_INTERNAL_SQL_STATEMENT(create_mt_out_index, "CREATE INDEX IF NOT EXISTS mt_out_dev ON mt_out(device, created_at)")
+    DEFINE_INTERNAL_SQL_STATEMENT(alter_mt_out_imdn_id, "ALTER TABLE mt_out ADD COLUMN imdn_id TEXT")
 
     SCOPED_DB(smsdb);
     SCOPED_TRANSACTION(dbtrans);
@@ -336,6 +338,22 @@ static int db_create(void)
     EXECUTE_VSTMT(create_mt_queue_index);
     EXECUTE_VSTMT(create_mt_out);
     EXECUTE_VSTMT(create_mt_out_index);
+
+    /* Best-effort migration for databases created before imdn_id existed:
+     * the ALTER fails with "duplicate column name" on already-migrated
+     * tables - ignore that case and continue initialization either way. */
+    {
+        char* errmsg = NULL;
+        const int mig = sqlite3_exec(smsdb, alter_mt_out_imdn_id_sql, NULL, NULL, &errmsg);
+        if (mig != SQLITE_OK) {
+            if (errmsg && strstr(errmsg, "duplicate column")) {
+                ast_log(LOG_DEBUG, "smsdb: mt_out.imdn_id already present (%s)\n", errmsg);
+            } else {
+                ast_log(LOG_NOTICE, "smsdb: could not add mt_out.imdn_id (continuing): %s\n", S_OR(errmsg, "?"));
+            }
+            sqlite3_free(errmsg);
+        }
+    }
 
     return create_incomingmsg_res || create_incomingmsg_index_res || create_outgoingmsg_res || create_outgoingref_res || create_outgoingpart_res ||
            create_outgoingpart_index_res || create_mt_queue_res || create_mt_queue_index_res || create_mt_out_res || create_mt_out_index_res;
@@ -376,13 +394,14 @@ static int db_init_statements(void)
     INIT_VSTMT(set_mt_out);
     INIT_VSTMT(set_mt_out_mr);
     INIT_VSTMT(get_mt_out_by_mr);
+    INIT_VSTMT(get_mt_out_imdn_id);
     INIT_VSTMT(list_mt_out);
 
     return get_incomingmsg_res || put_incomingmsg_res || del_incomingmsg_res || get_incomingmsg_cnt_res || put_outgoingref_res || set_outgoingref_res ||
            get_outgoingref_res || put_outgoingmsg_res || put_outgoingpart_res || del_outgoingmsg_res || del_outgoingpart_res || get_outgoingmsg_key_res ||
            get_outgoingpart_res || set_outgoingpart_res || cnt_outgoingpart_res || cnt_all_outgoingpart_res || get_outgoingmsg_res || get_all_status_res ||
            get_outgoingmsg_expired_res || put_mt_queue_res || get_mt_queue_res || set_mt_queue_res || pick_mt_queue_res || list_mt_queue_res || add_mt_out_res ||
-           set_mt_out_res || set_mt_out_mr_res || get_mt_out_by_mr_res || list_mt_out_res;
+           set_mt_out_res || set_mt_out_mr_res || get_mt_out_by_mr_res || get_mt_out_imdn_id_res || list_mt_out_res;
 }
 
 static void db_clean_statements(void)
@@ -417,6 +436,7 @@ static void db_clean_statements(void)
     CLEAN_STMT(set_mt_out);
     CLEAN_STMT(set_mt_out_mr);
     CLEAN_STMT(get_mt_out_by_mr);
+    CLEAN_STMT(get_mt_out_imdn_id);
     CLEAN_STMT(list_mt_out);
 }
 
@@ -1124,6 +1144,7 @@ static void mt_out_row_fill(struct smsdb_mt_out_row* row, sqlite3_stmt* stmt)
     const char* const msg    = (const char*)sqlite3_column_text(stmt, 3);
     const char* const ts     = (const char*)sqlite3_column_text(stmt, 4);
     const char* const state  = (const char*)sqlite3_column_text(stmt, 5);
+    const char* const imdn_id = (const char*)sqlite3_column_text(stmt, 8);
 
     row->id         = sqlite3_column_int(stmt, 0);
     ast_copy_string(row->device, S_OR(device, ""), sizeof(row->device));
@@ -1131,10 +1152,11 @@ static void mt_out_row_fill(struct smsdb_mt_out_row* row, sqlite3_stmt* stmt)
     ast_copy_string(row->msg, S_OR(msg, ""), sizeof(row->msg));
     ast_copy_string(row->ts, S_OR(ts, ""), sizeof(row->ts));
     ast_copy_string(row->state, S_OR(state, ""), sizeof(row->state));
+    ast_copy_string(row->imdn_id, S_OR(imdn_id, ""), sizeof(row->imdn_id));
     row->srr_status = sqlite3_column_int(stmt, 6);
     row->mr         = sqlite3_column_int(stmt, 7);
-    row->created_at = (long)sqlite3_column_int64(stmt, 8);
-    row->updated_at = (long)sqlite3_column_int64(stmt, 9);
+    row->created_at = (long)sqlite3_column_int64(stmt, 9);
+    row->updated_at = (long)sqlite3_column_int64(stmt, 10);
 }
 
 static int bind_text_or_null(sqlite3_stmt* stmt, int colno, const char* text)
@@ -1316,7 +1338,7 @@ int smsdb_mt_list(void* ctx, smsdb_mt_list_cb cb)
     return (res == SQLITE_DONE) ? 0 : -1;
 }
 
-int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const char* ts)
+int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const char* ts, const char* imdn_id)
 {
     if (ast_strlen_zero(device) || ast_strlen_zero(dst)) {
         return -1;
@@ -1341,6 +1363,10 @@ int smsdb_mt_out_add(const char* device, const char* dst, const char* msg, const
     }
     if ((res = bind_text_or_null(add_mt_out, 4, ts)) != SQLITE_OK) {
         ast_log(LOG_WARNING, "Couldn't bind ts to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+    if ((res = bind_text_or_null(add_mt_out, 5, imdn_id)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind imdn_id to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
         return -1;
     }
 
@@ -1444,6 +1470,34 @@ int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id
     }
 
     *id = sqlite3_column_int(get_mt_out_by_mr, 0);
+    return 0;
+}
+
+int smsdb_mt_out_get_imdn_id(int id, char* out, size_t len)
+{
+    if (id <= 0 || !out || len == 0) {
+        return -1;
+    }
+
+    out[0] = '\0';
+
+    int res;
+
+    SCOPED_DB(smsdb);
+    SCOPED_STMT(get_mt_out_imdn_id);
+
+    if ((res = sqlite3_bind_int(get_mt_out_imdn_id, 1, id)) != SQLITE_OK) {
+        ast_log(LOG_WARNING, "Couldn't bind id to stmt: [%d] %s\n", res, sqlite3_errmsg(smsdb));
+        return -1;
+    }
+
+    res = sqlite3_step(get_mt_out_imdn_id);
+    if (res != SQLITE_ROW) {
+        return -1;
+    }
+
+    const char* const imdn_id = (const char*)sqlite3_column_text(get_mt_out_imdn_id, 0);
+    ast_copy_string(out, S_OR(imdn_id, ""), len);
     return 0;
 }
 

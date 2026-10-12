@@ -52,6 +52,17 @@ static void mt_msg_token_destroy(void* obj)
     /* token carries only inline data; nothing to do */
 }
 
+/* one per fire-and-forget IMDN receipt transaction */
+struct mt_imdn_token {
+    char imdn_id[MT_IMDN_ID_LEN];
+    char user[DEVNAMELEN];
+};
+
+static void mt_imdn_token_destroy(void* obj)
+{
+    /* token carries only inline data; nothing to do */
+}
+
 static pthread_t mt_retry_thread = AST_PTHREADT_NULL;
 static pthread_t mt_web_thread   = AST_PTHREADT_NULL;
 
@@ -258,6 +269,105 @@ static const char* mt_sip_to_user(const char* uri, char* out, size_t len)
 }
 
 /*!
+ * \brief Format the current UTC time as RFC 3339 (\c YYYY-MM-DDTHH:MM:SSZ).
+ */
+static void mt_rfc3339_now(char* out, size_t len)
+{
+    const time_t now = time(NULL);
+    struct tm tm;
+
+    if (!len) {
+        return;
+    }
+    out[0] = '\0';
+    if (gmtime_r(&now, &tm)) {
+        strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    }
+}
+
+/*!
+ * \brief Build a message/cpim (RFC 3862) body carrying the IMDN request
+ * headers (RFC 5438) so the Linphone client auto-sends a delivery receipt
+ * back to us. Every line is CRLF terminated; the CPIM Content-length is the
+ * byte length of the SMS text (not of the whole message).
+ *
+ * \param from_num sender number (may include '+'; used inside <sip:...>)
+ * \param phone_user SIP user of the recipient (from sms_sip_to)
+ * \param domain host part of sms_sip_to
+ * \param mid our mt_queue message id (IMDN correlation secret, no @domain)
+ * \param msg plain SMS text
+ * \param buf output buffer (NUL terminated on return)
+ * \param len size of \a buf
+ * \retval 0 success, -1 when the body had to be truncated (logged)
+ */
+static int mt_build_cpim(const char* from_num, const char* phone_user, const char* domain, const char* mid, const char* msg, char* buf, size_t len)
+{
+    char dt[64];
+    size_t pos = 0;
+    int truncated = 0;
+
+#define MT_CPIM_APPEND(fmt, ...)                                                           \
+    do {                                                                                   \
+        const int wr = snprintf(buf + pos, len > pos ? len - pos : 0, fmt, ##__VA_ARGS__); \
+        if (wr < 0 || (size_t)wr >= (len > pos ? len - pos : 0)) {                         \
+            truncated = 1;                                                                  \
+            break;                                                                          \
+        }                                                                                   \
+        pos += (size_t)wr;                                                                  \
+    } while (0)
+
+    mt_rfc3339_now(dt, sizeof(dt));
+
+    MT_CPIM_APPEND("From: <sip:%s@%s>\r\n", S_OR(from_num, ""), S_OR(domain, ""));
+    if (!truncated) {
+        MT_CPIM_APPEND("To: <sip:%s@%s>\r\n", S_OR(phone_user, ""), S_OR(domain, ""));
+    }
+    if (!truncated) {
+        MT_CPIM_APPEND("DateTime: %s\r\n", S_OR(dt, ""));
+    }
+    if (!truncated) {
+        MT_CPIM_APPEND("NS: urn:ietf:params:imdn\r\n");
+    }
+    if (!truncated) {
+        MT_CPIM_APPEND("imdn.Message-ID: %s\r\n", S_OR(mid, ""));
+    }
+    if (!truncated) {
+        MT_CPIM_APPEND("imdn.Disposition-Notification: positive-delivery, negative-delivery\r\n");
+    }
+    if (!truncated) {
+        MT_CPIM_APPEND("Content-type: text/plain; charset=UTF-8\r\n");
+    }
+    if (!truncated) {
+        MT_CPIM_APPEND("Content-length: %d\r\n", (int)strlen(S_OR(msg, "")));
+    }
+    if (!truncated) {
+        MT_CPIM_APPEND("\r\n");
+    }
+    if (!truncated) {
+        /* body: keep as much as fits, NUL-terminated */
+        const size_t avail = len - pos;
+        const char* const text = S_OR(msg, "");
+        const size_t mlen = strlen(text);
+        size_t copy = mlen;
+        if (copy + 1 > avail) {
+            copy = avail - 1;
+            truncated = 1;
+        }
+        if (mlen) {
+            memcpy(buf + pos, text, copy);
+        }
+        pos += copy;
+        buf[pos] = '\0';
+    }
+#undef MT_CPIM_APPEND
+
+    if (truncated) {
+        ast_log(LOG_WARNING, "mt: CPIM body truncated to %zu bytes (mid=%s)\n", pos, S_OR(mid, ""));
+    }
+    return truncated ? -1 : 0;
+}
+
+/*!
  * \brief Build and send one MESSAGE for a mt_queue row.
  */
 static void mt_send_row(const struct smsdb_mt_row* row)
@@ -344,10 +454,23 @@ static void mt_send_row(const struct smsdb_mt_row* row)
         ast_sip_add_header(tdata, "Message-ID", msgid_hdr);
     }
 
+    /* Wrap the SMS in message/cpim (RFC 3862) with imdn.Message-ID and
+     * imdn.Disposition-Notification (RFC 5438): the Linphone client then
+     * auto-sends a delivered IMDN receipt back, which we correlate by mid. */
+    char cpim[16384];
+    char phone_user[DEVNAMELEN];
+    const char* const puser = mt_sip_to_user(sip_to, phone_user, sizeof(phone_user));
+    if (ast_strlen_zero(puser)) {
+        pjsip_tx_data_dec_ref(tdata);
+        mt_send_fail(&cur, "sms_sip_to has no user part for CPIM To");
+        return;
+    }
+    mt_build_cpim(cur.from_num, puser, domain, cur.mid, cur.msg, cpim, sizeof(cpim));
+
     struct ast_sip_body body = {
-        .type      = "text",
-        .subtype   = "plain",
-        .body_text = cur.msg,
+        .type      = "message",
+        .subtype   = "cpim",
+        .body_text = cpim,
     };
     ast_sip_add_body(tdata, &body);
     if (!tdata->msg->body) {
@@ -378,6 +501,166 @@ static void mt_send_row(const struct smsdb_mt_row* row)
         return;
     }
     /* success: the callback will finalize the row state */
+}
+
+/*!
+ * \brief Light callback for a fire-and-forget IMDN receipt (log only, no retry).
+ */
+static void mt_imdn_response_callback(void* token, pjsip_event* e)
+{
+    struct mt_imdn_token* const tok = token;
+    int status_code = 0;
+
+    switch (e->body.tsx_state.type) {
+        case PJSIP_EVENT_RX_MSG:
+            status_code = e->body.tsx_state.tsx ? e->body.tsx_state.tsx->status_code : 0;
+            break;
+        case PJSIP_EVENT_TIMER:
+            status_code = 408; /* request timed out */
+            break;
+        default:
+            status_code = 0;
+            break;
+    }
+
+    ast_log(LOG_NOTICE, "mt: IMDN receipt to %s (imdn=%s) status=%d\n",
+        S_OR(tok->user, "?"), S_OR(tok->imdn_id, "?"), status_code);
+    ao2_ref(tok, -1);
+    __sync_sub_and_fetch(&mt_inflight, 1);
+}
+
+/*!
+ * \brief Send a fire-and-forget RFC 5438 delivery notification
+ * (message/imdn+xml, Content-Disposition: notification) to the phone AOR
+ * after the modem reports the outgoing SMS as smsc_ok/delivered_to_handset
+ * (delivered form) or failed (failed form). The phone maps it to
+ * DeliveredToUser for the matching local MO message by imdn_id.
+ *
+ * Does not touch mt_queue and never retries.
+ */
+void mt_send_imdn_receipt(const char* device, const char* imdn_id, const char* to_gsm_node_hint, const char* state)
+{
+    char sip_to[PATHLEN];
+    char dialtarget[PATHLEN];
+    char endpoint_name[DEVNAMELEN];
+    char user[DEVNAMELEN];
+    char domain[128];
+    char from_buf[256];
+    char msgid_hdr[320];
+    char body[1024];
+    char dt[64];
+    pjsip_tx_data* tdata = NULL;
+    struct mt_imdn_token* token;
+    int res;
+
+    if (ast_strlen_zero(device) || ast_strlen_zero(imdn_id)) {
+        return;
+    }
+
+    /* read the per-device SIP config (short lock window) */
+    {
+        RAII_VAR(struct pvt*, pvt, pvt_find(device), pvt_unlock);
+        if (!pvt) {
+            ast_log(LOG_WARNING, "mt: IMDN receipt: device '%s' not found\n", device);
+            return;
+        }
+        ast_copy_string(sip_to, S_OR(CONF_UNIQ(pvt, sms_sip_to), ""), sizeof(sip_to));
+        ast_copy_string(endpoint_name, S_OR(CONF_UNIQ(pvt, sms_sip_endpoint), ""), sizeof(endpoint_name));
+    }
+
+    if (ast_strlen_zero(sip_to) || ast_strlen_zero(endpoint_name)) {
+        ast_log(LOG_WARNING, "mt: IMDN receipt: sms_sip_to/sms_sip_endpoint not configured for device %s\n", device);
+        return;
+    }
+
+    const char* const u = mt_sip_to_user(sip_to, user, sizeof(user));
+    if (ast_strlen_zero(u)) {
+        ast_log(LOG_WARNING, "mt: IMDN receipt: sms_sip_to has no user part\n");
+        return;
+    }
+
+    RAII_VAR(char*, uri, NULL, ast_free);
+    RAII_VAR(struct ast_sip_endpoint*, endpoint, NULL, ao2_cleanup);
+
+    /* Same dialstring resolution as mt_send_row: R-URI carries user+port+TLS. */
+    snprintf(dialtarget, sizeof(dialtarget), "PJSIP/%s@%s", user, endpoint_name);
+    endpoint = ast_sip_get_endpoint(dialtarget, 1, &uri);
+    if (!endpoint) {
+        ast_log(LOG_WARNING, "mt: IMDN receipt: SIP endpoint %s not found\n", endpoint_name);
+        return;
+    }
+
+    if (ast_sip_create_request("MESSAGE", NULL, endpoint, uri, NULL, &tdata)) {
+        ast_log(LOG_ERROR, "mt: IMDN receipt: could not create MESSAGE request\n");
+        return;
+    }
+
+    ast_sip_update_to_uri(tdata, sip_to);
+
+    /* From: sip:<gsm-number>@<domain> (the SMS recipient number is the sender of the receipt). */
+    mt_extract_domain(sip_to, domain, sizeof(domain));
+    if (!ast_strlen_zero(to_gsm_node_hint) && !ast_strlen_zero(domain)) {
+        snprintf(from_buf, sizeof(from_buf), "sip:%s@%s", to_gsm_node_hint, domain);
+        ast_sip_update_from(tdata, from_buf);
+    }
+
+    /* Unique Message-ID, disjoint from MT message ids. */
+    if (!ast_strlen_zero(domain)) {
+        char imdn_id_short[200];
+        ast_copy_string(imdn_id_short, imdn_id, sizeof(imdn_id_short));
+        snprintf(msgid_hdr, sizeof(msgid_hdr), "imdn-%s@%s", imdn_id_short, domain);
+        ast_sip_add_header(tdata, "Message-ID", msgid_hdr);
+    }
+
+    /* IMDN XML body: delivered for smsc_ok/delivered_to_handset, failed otherwise. */
+    {
+        const int ok = ast_strlen_zero(state) || strcmp(state, "failed") != 0;
+        mt_rfc3339_now(dt, sizeof(dt));
+        if (ok) {
+            snprintf(body, sizeof(body),
+                     "<imdn xmlns=\"urn:ietf:params:xml:ns:imdn\"><message-id>%s</message-id>"
+                     "<datetime>%s</datetime><delivery-notification><status><delivered/></status>"
+                     "</delivery-notification></imdn>", imdn_id, dt);
+        } else {
+            snprintf(body, sizeof(body),
+                     "<imdn xmlns=\"urn:ietf:params:xml:ns:imdn\"><message-id>%s</message-id>"
+                     "<datetime>%s</datetime><delivery-notification><status><failed/></status>"
+                     "<reason>SMSC error</reason></delivery-notification></imdn>", imdn_id, dt);
+        }
+    }
+
+    struct ast_sip_body body_msg = {
+        .type      = "message",
+        .subtype   = "imdn+xml",
+        .body_text = body,
+    };
+    ast_sip_add_body(tdata, &body_msg);
+    if (!tdata->msg->body) {
+        pjsip_tx_data_dec_ref(tdata);
+        ast_log(LOG_WARNING, "mt: IMDN receipt: could not add body\n");
+        return;
+    }
+    ast_sip_add_header(tdata, "Content-Disposition", "notification");
+
+    token = ao2_alloc_options(sizeof(*token), mt_imdn_token_destroy, AO2_ALLOC_OPT_LOCK_NOLOCK);
+    if (!token) {
+        pjsip_tx_data_dec_ref(tdata);
+        ast_log(LOG_WARNING, "mt: IMDN receipt: out of memory\n");
+        return;
+    }
+    ast_copy_string(token->imdn_id, imdn_id, sizeof(token->imdn_id));
+    ast_copy_string(token->user, user, sizeof(token->user));
+
+    __sync_add_and_fetch(&mt_inflight, 1);
+    ast_log(LOG_NOTICE, "mt: sending IMDN receipt imdn=%s (state=%s) to %s via %s\n", imdn_id, S_OR(state, "delivered"), sip_to, endpoint_name);
+    res = ast_sip_send_request(tdata, NULL, endpoint, token, mt_imdn_response_callback);
+    if (res) {
+        __sync_sub_and_fetch(&mt_inflight, 1);
+        ao2_ref(token, -1);
+        ast_log(LOG_ERROR, "mt: IMDN receipt imdn=%s: send request failed (%d)\n", imdn_id, res);
+        return;
+    }
+    /* fire-and-forget: the callback only logs the final status */
 }
 
 /*!
@@ -590,6 +873,7 @@ static int mt_json_out_cb(void* ctx, const struct smsdb_mt_out_row* row)
     ast_json_object_set(j, "state", ast_json_string_create(row->state));
     ast_json_object_set(j, "srr_status", ast_json_integer_create(row->srr_status));
     ast_json_object_set(j, "mr", ast_json_integer_create(row->mr));
+    ast_json_object_set(j, "imdn_id", ast_json_string_create(row->imdn_id));
     ast_json_object_set(j, "created_at", ast_json_integer_create(row->created_at));
     ast_json_object_set(j, "updated_at", ast_json_integer_create(row->updated_at));
     ast_json_array_append(((struct mt_json_ctx*)ctx)->arr, j);
