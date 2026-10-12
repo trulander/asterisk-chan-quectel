@@ -214,12 +214,44 @@ static void mt_msg_response_callback(void* token, pjsip_event* e)
 }
 
 /*!
+ * \brief Extract the user part of a sip:user@domain URI.
+ * Returns a pointer to \a out, or NULL when there is no user.
+ */
+static const char* mt_sip_to_user(const char* uri, char* out, size_t len)
+{
+    const char* p = uri;
+    const char* at;
+    size_t n;
+
+    if (ast_strlen_zero(uri)) {
+        return NULL;
+    }
+    if (ast_begins_with(p, "sips:")) {
+        p += 5;
+    } else if (ast_begins_with(p, "sip:")) {
+        p += 4;
+    }
+    at = strchr(p, '@');
+    if (!at) {
+        return NULL; /* user must be followed by @host; no @ => no user */
+    }
+    n = (size_t)(at - p);
+    if (n >= len) {
+        n = len - 1;
+    }
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return out;
+}
+
+/*!
  * \brief Build and send one MESSAGE for a mt_queue row.
  */
 static void mt_send_row(const struct smsdb_mt_row* row)
 {
     struct smsdb_mt_row cur = *row;
     char sip_to[PATHLEN];
+    char dialtarget[PATHLEN];
     char endpoint_name[DEVNAMELEN];
     char domain[128];
     char from_buf[256];
@@ -253,16 +285,32 @@ static void mt_send_row(const struct smsdb_mt_row* row)
 
     RAII_VAR(char*, uri, NULL, ast_free);
     RAII_VAR(struct ast_sip_endpoint*, endpoint, NULL, ao2_cleanup);
-    endpoint = ast_sip_get_endpoint(endpoint_name, 1, &uri);
+
+    /*
+     * Resolve by dialstring form PJSIP/user@endpoint (same as the known-good
+     * MessageSend path). ast_sip_get_endpoint() then returns uri = the AOR contact
+     * URI WITH the destination user inserted, e.g. sip:1001@sipsis.keblog.ru:443;transport=tls.
+     * Routing (and Flexisip's 404-vs-2xx decision) is keyed on the Request-URI userpart,
+     * so the R-URI MUST carry the user
+     *   - a bare contact URI (no user) makes Flexisip answer 404 (no-contact-for-aor);
+     *   - a bare user URI without host:port;transport=tls fails transport selection.
+     * To keeps the real destination URI from sms_sip_to.
+     */
+    {
+        char user[DEVNAMELEN];
+        const char* u = mt_sip_to_user(sip_to, user, sizeof(user));
+        if (!u || ast_strlen_zero(u)) {
+            mt_send_fail(&cur, "sms_sip_to has no user part");
+            return;
+        }
+        snprintf(dialtarget, sizeof(dialtarget), "PJSIP/%s@%s", u, endpoint_name);
+    }
+    endpoint = ast_sip_get_endpoint(dialtarget, 1, &uri);
     if (!endpoint) {
         mt_send_fail(&cur, "SIP endpoint not found");
         return;
     }
 
-    /* R-URI must come from the endpoint's AOR contact (carries host:port;transport=tls),
-     * like res_pjsip_messaging's PJSIP/user@endpoint dialstring form. Using the bare
-     * sip_to as R-URI leaves it without a port/transport param, so pjsip falls back to
-     * UDP (not configured) -> transport error. To remains the real destination user. */
     if (ast_sip_create_request("MESSAGE", NULL, endpoint, uri, NULL, &tdata)) {
         mt_send_fail(&cur, "could not create MESSAGE request");
         return;
