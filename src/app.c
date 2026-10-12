@@ -280,9 +280,12 @@ static int app_send_sms_exec(attribute_unused struct ast_channel* channel, const
 
     /* Record the outgoing SMS for MT delivery status tracking (honest state set by send_sms result below). */
     const int mt_out_id = smsdb_mt_out_add(args.resource, args.number, args.message, "");
+    ast_log(LOG_NOTICE, "[%s] MT: outgoing SMS recorded in mt_out (id=%d dst=%s)\n",
+        args.resource, mt_out_id, args.number);
 
     if (send_sms(args.resource, "", args.number, args.message, parse_validity(args.validity), parse_report_flag(args.report), mt_out_id)) {
-        ast_log(LOG_ERROR, "[%s] %s\n", args.resource, error2str(chan_quectel_err));
+        ast_log(LOG_ERROR, "[%s] MT: outgoing SMS refused by modem, mt_out #%d -> failed (%s)\n",
+            args.resource, mt_out_id, error2str(chan_quectel_err));
         /* The modem refused the message: do not leave it marked as submitted. */
         if (mt_out_id > 0) {
             smsdb_mt_out_set_state(mt_out_id, "failed", 0);
@@ -290,6 +293,8 @@ static int app_send_sms_exec(attribute_unused struct ast_channel* channel, const
         return -1;
     }
 
+    ast_log(LOG_NOTICE, "[%s] MT: outgoing SMS handed to modem (mt_out id=%d dst=%s)\n",
+        args.resource, mt_out_id, args.number);
     return 0;
 }
 

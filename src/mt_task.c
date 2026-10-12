@@ -130,11 +130,16 @@ static void mt_send_fail(const struct smsdb_mt_row* row, const char* reason)
     const int max_attempts = CONF_GLOBAL(mt_retry_max_attempts);
 
     if (attempts >= max_attempts) {
+        ast_log(LOG_ERROR, "mt: MESSAGE mid=%s failed, max attempts (%d) reached (%s)\n",
+            row->mid, max_attempts, S_OR(reason, "?"));
         smsdb_mt_set_result(row->mid, "retrying", attempts, 0, "max attempts reached", 0, 0);
         return;
     }
 
-    const int next_retry_at = (int)now + mt_backoff_seconds(attempts);
+    const int this_delay = mt_backoff_seconds(attempts);
+    const int next_retry_at = (int)now + this_delay;
+    ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s send failed (%s) -> retrying, attempt %d/%d, next in ~%ds\n",
+        row->mid, S_OR(reason, "?"), attempts, max_attempts, this_delay);
     smsdb_mt_set_result(row->mid, "retrying", attempts, next_retry_at, reason, 0, 0);
 }
 
@@ -175,14 +180,17 @@ static void mt_msg_response_callback(void* token, pjsip_event* e)
         /* Flexisip accepted while the phone is offline (will hold the message) */
         ast_copy_string(last_result, "202 accepted (queued)", sizeof(last_result));
         queued = 1;
+        ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> queued (%s)\n", tok->mid, last_result);
     } else if (status_code >= 200 && status_code < 300) {
         /* phone online, Flexisip forwarded and got a 2xx from the phone */
         snprintf(last_result, sizeof(last_result), "%d delivered", status_code);
         delivered = 1;
+        ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> delivered (SIP %d)\n", tok->mid, status_code);
     } else if (status_code >= 100 && status_code < 200) {
         /* 110 Push / provisional: phone offline, Flexisip keeps the message */
         snprintf(last_result, sizeof(last_result), "%d provisional (queued)", status_code);
         queued = 1;
+        ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> queued (%s)\n", tok->mid, last_result);
     } else {
         /* 3xx/4xx/5xx/transport: schedule a retry with backoff */
         const int attempts = tok->attempts + 1;
@@ -193,9 +201,14 @@ static void mt_msg_response_callback(void* token, pjsip_event* e)
             ast_copy_string(last_result, "transport error", sizeof(last_result));
         }
         if (attempts >= max_attempts) {
+            ast_log(LOG_ERROR, "mt: MESSAGE mid=%s max attempts (%d) reached (%s)\n",
+                tok->mid, max_attempts, last_result);
             smsdb_mt_set_result(tok->mid, "retrying", attempts, 0, "max attempts reached", 0, 0);
         } else {
-            const int next_retry_at = (int)now + mt_backoff_seconds(attempts);
+            const int this_delay = mt_backoff_seconds(attempts);
+            const int next_retry_at = (int)now + this_delay;
+            ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> retrying (attempt %d/%d, %s, next in ~%ds)\n",
+                tok->mid, attempts, max_attempts, last_result, this_delay);
             smsdb_mt_set_result(tok->mid, "retrying", attempts, next_retry_at, last_result, 0, 0);
         }
         ao2_ref(tok, -1);
@@ -354,6 +367,9 @@ static void mt_send_row(const struct smsdb_mt_row* row)
 
     /* count before send so a synchronous callback cannot leave the counter stale */
     __sync_add_and_fetch(&mt_inflight, 1);
+    ast_log(LOG_NOTICE, "mt: sending MESSAGE mid=%s (device %s from %s to %s, RURI %s) attempt %d/%d\n",
+        cur.mid, cur.device, S_OR(cur.from_num, "?"), sip_to, uri, cur.attempts + 1,
+        CONF_GLOBAL(mt_retry_max_attempts));
     res = ast_sip_send_request(tdata, NULL, endpoint, token, mt_msg_response_callback);
     if (res) {
         __sync_sub_and_fetch(&mt_inflight, 1);
@@ -771,6 +787,8 @@ int mt_test_inject(const char* device, const char* from, const char* msg)
         return -1;
     }
 
+    ast_log(LOG_NOTICE, "mt: test-inject -> MT queue (device=%s from=%s mid=%s msg=%s)\n",
+        device, S_OR(from, "?"), mid, S_OR(msg, "?"));
     mt_kick();
     return 0;
 }

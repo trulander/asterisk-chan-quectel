@@ -1627,7 +1627,7 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
                 if (!smsdb_mt_out_find_by_mr(PVT_ID(pvt), ast_str_buffer(oa), mr, &mt_out_id) && mt_out_id > 0) {
                     const char* const mt_state = (st & 0x40) ? "failed" : (st == 0 ? "delivered_to_handset" : "smsc_ok");
                     smsdb_mt_out_set_state(mt_out_id, mt_state, st);
-                    ast_verb(2, "[%s][SMS:%d] MT out #%d -> %s (srr=%d)\n", PVT_ID(pvt), mr, mt_out_id, mt_state, st);
+                    ast_log(LOG_NOTICE, "[%s] MT: outgoing SMS mt_out #%d -> %s (srr=%d)\n", PVT_ID(pvt), mt_out_id, mt_state, st);
                 }
             }
 
@@ -1725,7 +1725,8 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
                 if (smsdb_mt_put(PVT_ID(pvt), mid, ast_str_buffer(oa), ast_str_buffer(fullmsg), ast_str_buffer(scts_str))) {
                     ast_log(LOG_WARNING, "[%s][SMS:%d] MT queue put failed (mid=%s)\n", PVT_ID(pvt), (int)udh.ref, mid);
                 } else {
-                    ast_verb(3, "[%s][SMS:%d] MT queued mid=%s from %s\n", PVT_ID(pvt), (int)udh.ref, mid, ast_str_buffer(oa));
+                    ast_log(LOG_NOTICE, "[%s] MT: incoming SMS queued mid=%s from %s (msg=%s)\n", PVT_ID(pvt), mid,
+                            ast_str_buffer(oa), ast_str_strlen(fullmsg) ? ast_str_buffer(fullmsg) : "<empty>");
                     mt_kick();
                 }
                 ast_json_object_set(sms, "mid", ast_json_string_create(mid));
