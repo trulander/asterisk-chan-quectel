@@ -69,6 +69,12 @@ endif()
 target_compile_definitions(asterisk-chan-quectel PRIVATE
     _GNU_SOURCE
     HAVE_CONFIG_H
+    # Endianness/auto-config macros required by the bundled pjproject headers
+    # (pj/config.h refuses to build without them; identical to what Asterisk
+    # passes in third-party/pjproject/build.mak).
+    PJ_AUTOCONF=1
+    PJ_IS_BIG_ENDIAN=0
+    PJ_IS_LITTLE_ENDIAN=1
 )
 
 set_target_properties(asterisk-chan-quectel PROPERTIES
