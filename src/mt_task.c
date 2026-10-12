@@ -259,7 +259,11 @@ static void mt_send_row(const struct smsdb_mt_row* row)
         return;
     }
 
-    if (ast_sip_create_request("MESSAGE", NULL, endpoint, sip_to, NULL, &tdata)) {
+    /* R-URI must come from the endpoint's AOR contact (carries host:port;transport=tls),
+     * like res_pjsip_messaging's PJSIP/user@endpoint dialstring form. Using the bare
+     * sip_to as R-URI leaves it without a port/transport param, so pjsip falls back to
+     * UDP (not configured) -> transport error. To remains the real destination user. */
+    if (ast_sip_create_request("MESSAGE", NULL, endpoint, uri, NULL, &tdata)) {
         mt_send_fail(&cur, "could not create MESSAGE request");
         return;
     }
