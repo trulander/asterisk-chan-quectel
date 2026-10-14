@@ -354,14 +354,40 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
             break;
 
         case CMD_AT_CPCMREG0:
+            pvt->pcm_stop_legacy_fallback = 0;
             at_ok_response_dbg(4, pvt, ecmd, NULL);
             break;
 
         case CMD_AT_CHUP:
         case CMD_AT_QHUP:
         case CMD_AT_CHLD_1x:
-            CPVT_RESET_FLAG(task->cpvt, CALL_FLAG_NEED_HANGUP);
-            at_ok_response_dbg(1, pvt, ecmd, "Successful hangup for call idx:%d", task->cpvt->call_idx);
+            at_ok_response_dbg(1, pvt, ecmd, "Hangup accepted for call idx:%d; verifying with AT+CLCC", task->cpvt->call_idx);
+            if (at_enqueue_hangup_verify(task->cpvt)) {
+                at_ok_response_err(pvt, ecmd, "Could not enqueue post-hangup AT+CLCC for call idx:%d", task->cpvt->call_idx);
+            }
+            break;
+
+        case CMD_AT_CLCC_HANGUP:
+            if (!CPVT_TEST_FLAG(task->cpvt, CALL_FLAG_HANGUP_VERIFY)) {
+                at_ok_response_err(pvt, ecmd, "Unexpected post-hangup AT+CLCC result for call idx:%d", task->cpvt->call_idx);
+            } else if (!CPVT_TEST_FLAG(task->cpvt, CALL_FLAG_HANGUP_CLCC_ALIVE)) {
+                CPVT_RESET_FLAGS(task->cpvt, CALL_FLAG_HANGUP_VERIFY | CALL_FLAG_HANGUP_RETRY);
+                at_ok_response_dbg(1, pvt, ecmd, "Modem confirmed release for call idx:%d", task->cpvt->call_idx);
+                if (task->cpvt->state != CALL_STATE_RELEASED) {
+                    cpvt_change_state(task->cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_CLEARING);
+                }
+            } else if (!CPVT_TEST_FLAG(task->cpvt, CALL_FLAG_HANGUP_RETRY)) {
+                CPVT_RESET_FLAG(task->cpvt, CALL_FLAG_HANGUP_VERIFY);
+                CPVT_SET_FLAG(task->cpvt, CALL_FLAG_HANGUP_RETRY);
+                at_ok_response_wrn(pvt, ecmd, "Call idx:%d is still active after hangup; retrying once", task->cpvt->call_idx);
+                if (at_enqueue_hangup(task->cpvt, task->cpvt->call_idx, AST_CAUSE_NORMAL_CLEARING)) {
+                    at_ok_response_err(pvt, ecmd, "Could not enqueue hangup retry for call idx:%d", task->cpvt->call_idx);
+                }
+            } else {
+                CPVT_RESET_FLAG(task->cpvt, CALL_FLAG_HANGUP_VERIFY);
+                at_ok_response_err(pvt, ecmd, "Call idx:%d is still active after the hangup retry", task->cpvt->call_idx);
+            }
+            CPVT_RESET_FLAG(task->cpvt, CALL_FLAG_HANGUP_CLCC_ALIVE);
             break;
 
         case CMD_AT_CMGS:
@@ -730,13 +756,30 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
             break;
 
         case CMD_AT_CPCMREG0:
-            at_err_response_err(pvt, ecmd, "Could not deactivate audio stream");
+            if (pvt->is_simcom && CONF_UNIQ(pvt, uac) == TRIBOOL_FALSE && !pvt->pcm_stop_legacy_fallback) {
+                pvt->pcm_stop_legacy_fallback = 1;
+                at_err_response_wrn(pvt, ecmd, "PCM stop rejected; retrying once with legacy AT+CPCMREG=0");
+                if (at_enqueue_cpcmreg(task->cpvt, 0)) {
+                    at_err_response_err(pvt, ecmd, "Could not enqueue legacy PCM stop retry");
+                }
+            } else {
+                pvt->pcm_stop_legacy_fallback = 0;
+                at_err_response_err(pvt, ecmd, "Could not deactivate audio stream after compatibility retry");
+            }
             break;
 
         case CMD_AT_CHUP:
         case CMD_AT_QHUP:
         case CMD_AT_CHLD_1x:
-            at_err_response_err(pvt, ecmd, "Error sending hangup for call idx:%d", task->cpvt->call_idx);
+            at_err_response_wrn(pvt, ecmd, "Hangup command failed for call idx:%d; verifying modem state with AT+CLCC", task->cpvt->call_idx);
+            if (at_enqueue_hangup_verify(task->cpvt)) {
+                at_err_response_err(pvt, ecmd, "Could not enqueue post-failure AT+CLCC for call idx:%d", task->cpvt->call_idx);
+            }
+            break;
+
+        case CMD_AT_CLCC_HANGUP:
+            CPVT_RESET_FLAGS(task->cpvt, CALL_FLAG_HANGUP_VERIFY | CALL_FLAG_HANGUP_CLCC_ALIVE);
+            at_err_response_err(pvt, ecmd, "Could not verify hangup state for call idx:%d", task->cpvt->call_idx);
             break;
 
         case CMD_AT_CMGR:
@@ -949,6 +992,9 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
     if (cpvt) {
         /* cpvt alive */
         CPVT_SET_FLAG(cpvt, CALL_FLAG_ALIVE);
+        if (CPVT_TEST_FLAG(cpvt, CALL_FLAG_HANGUP_VERIFY)) {
+            CPVT_SET_FLAG(cpvt, CALL_FLAG_HANGUP_CLCC_ALIVE);
+        }
 
         if (dir != CPVT_DIRECTION(cpvt)) {
             ast_log(LOG_ERROR, "[%s] CLCC call idx:%d - direction mismatch %d/%d\n", PVT_ID(pvt), cpvt->call_idx, dir, CPVT_DIRECTION(cpvt));

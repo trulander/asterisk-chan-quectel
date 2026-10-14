@@ -813,15 +813,6 @@ int at_enqueue_dial(struct cpvt* cpvt, const char* number, int clir)
         cnt++;
     }
 
-    if (pvt->is_simcom && CONF_UNIQ(pvt, uac) == TRIBOOL_FALSE && pvt->has_voice) {
-        /* SIM7600 serial-PCM: deactivate the in-modem PCM/audio stream before dialing so
-         * the audio path is known-clean at call start and release never leaves it stuck
-         * (mirrors the biaide serial-PCM model). Safe: a failure here is non-fatal. */
-        DECLARE_AT_CMD(cpcmreg0, "+CPCMREG=0");
-        ATQ_CMD_INIT_ST(cmds[cnt], CMD_AT_CPCMREG0, AT_CMD(cpcmreg0));
-        cnt++;
-    }
-
     if (at_fill_generic_cmd(&cmds[cnt], AT_CMD(atd), number)) {
         ast_free(tmp);
         chan_quectel_err = E_CMD_FORMAT;
@@ -869,16 +860,6 @@ int at_enqueue_answer(struct cpvt* cpvt)
             ast_log(LOG_ERROR, "[%s] Request answer for call idx %d with state '%s'\n", PVT_ID(cpvt->pvt), cpvt->call_idx, call_state2str(cpvt->state));
             chan_quectel_err = E_UNKNOWN;
             return -1;
-    }
-
-    if (cpvt->state == CALL_STATE_INCOMING && cpvt->pvt->is_simcom && CONF_UNIQ(cpvt->pvt, uac) == TRIBOOL_FALSE &&
-        cpvt->pvt->has_voice) {
-        /* SIM7600 serial-PCM: deactivate the in-modem PCM/audio stream before answering so
-         * the audio path is known-clean at call start (biaide serial-PCM model). */
-        if (at_enqueue_cpcmreg(cpvt, 0)) {
-            chan_quectel_err = E_QUEUE;
-            return -1;
-        }
     }
 
     if (at_fill_generic_cmd(&cmd, fmt, cpvt->call_idx)) {
@@ -1352,6 +1333,24 @@ int at_enqueue_clcc(struct cpvt* cpvt)
     static const at_queue_cmd_t cmd = ATQ_CMD_DECLARE_ST(CMD_AT_CLCC, clcc);
 
     if (at_queue_insert_const(cpvt, &cmd, 1u, 1)) {
+        chan_quectel_err = E_QUEUE;
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Verify that the modem actually released the call after CHUP/QHUP. The modem
+ * accepts a hangup command before it has completed the radio-side release. */
+int at_enqueue_hangup_verify(struct cpvt* cpvt)
+{
+    DECLARE_AT_CMD(clcc, "+CLCC");
+    static const at_queue_cmd_t cmd = ATQ_CMD_DECLARE_ST(CMD_AT_CLCC_HANGUP, clcc);
+
+    CPVT_SET_FLAG(cpvt, CALL_FLAG_HANGUP_VERIFY);
+    CPVT_RESET_FLAG(cpvt, CALL_FLAG_HANGUP_CLCC_ALIVE);
+    if (at_queue_insert_const(cpvt, &cmd, 1u, 1)) {
+        CPVT_RESET_FLAG(cpvt, CALL_FLAG_HANGUP_VERIFY);
         chan_quectel_err = E_QUEUE;
         return -1;
     }
@@ -1842,13 +1841,18 @@ int at_enqueue_coutgain(struct cpvt* cpvt, int gain)
 
 int at_enqueue_cpcmreg(struct cpvt* cpvt, int reg)
 {
-    DECLARE_AT_CMD(cpcmreg_0, "+CPCMREG=0");
+    /* SIMCom documents =0,1 as the explicit PCM stop form. Some older firmware
+     * only accepts =0, so the error path makes exactly one compatibility retry. */
+    DECLARE_AT_CMD(cpcmreg_0, "+CPCMREG=0,1");
+    DECLARE_AT_CMD(cpcmreg_0_legacy, "+CPCMREG=0");
     DECLARE_AT_CMD(cpcmreg_1, "+CPCMREG=1");
 
-    static const at_queue_cmd_t cmd0 = ATQ_CMD_DECLARE_ST(CMD_AT_CPCMREG0, cpcmreg_0);
-    static const at_queue_cmd_t cmd1 = ATQ_CMD_DECLARE_ST(CMD_AT_CPCMREG1, cpcmreg_1);
+    static const at_queue_cmd_t cmd0        = ATQ_CMD_DECLARE_ST(CMD_AT_CPCMREG0, cpcmreg_0);
+    static const at_queue_cmd_t cmd0_legacy = ATQ_CMD_DECLARE_ST(CMD_AT_CPCMREG0, cpcmreg_0_legacy);
+    static const at_queue_cmd_t cmd1        = ATQ_CMD_DECLARE_ST(CMD_AT_CPCMREG1, cpcmreg_1);
+    const at_queue_cmd_t* cmd               = reg ? &cmd1 : (cpvt->pvt->pcm_stop_legacy_fallback ? &cmd0_legacy : &cmd0);
 
-    if (at_queue_insert_const(cpvt, reg ? &cmd1 : &cmd0, 1u, 1)) {
+    if (at_queue_insert_const(cpvt, cmd, 1u, 1)) {
         chan_quectel_err = E_QUEUE;
         return -1;
     }
@@ -1858,7 +1862,7 @@ int at_enqueue_cpcmreg(struct cpvt* cpvt, int reg)
 
 int at_cpcmreg_immediately(struct pvt* pvt, int reg)
 {
-    DECLARE_NAKED_AT_CMD(cpcmreg_0, "+CPCMREG=0,0");
+    DECLARE_NAKED_AT_CMD(cpcmreg_0, "+CPCMREG=0,1");
     DECLARE_NAKED_AT_CMD(cpcmreg_1, "+CPCMREG=1");
 
     static const at_queue_cmd_t cmd0 = ATQ_CMD_DECLARE_ST(CMD_AT_CPCMREG0, cpcmreg_0);

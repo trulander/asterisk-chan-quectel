@@ -83,6 +83,7 @@
     _(AT_CHLD_2, "AT+CHLD=2")                       \
     _(AT_CHLD_3, "AT+CHLD=3")                       \
     _(AT_CLCC, "AT+CLCC")                           \
+    _(AT_CLCC_HANGUP, "AT+CLCC (hangup verify)")    \
     _(AT_QINDCFG_CSQ, "AT+QINDCFG=\"csq\"")         \
     _(AT_QINDCFG_ACT, "AT+QINDCFG=\"act\"")         \
     _(AT_QINDCFG_RING, "AT+QINDCFG=\"ring\"")       \
@@ -158,6 +159,7 @@ int at_enqueue_delete_sms_n(struct cpvt* cpvt, int idx, tristate_bool_t ack);
 int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause);
 int at_enqueue_volsync(struct cpvt* cpvt);
 int at_enqueue_clcc(struct cpvt* cpvt);
+int at_enqueue_hangup_verify(struct cpvt* cpvt);
 int at_enqueue_activate(struct cpvt* cpvt);
 int at_enqueue_flip_hold(struct cpvt* cpvt);
 int at_enqueue_conference(struct cpvt* cpvt);

@@ -46,8 +46,11 @@ typedef enum {
     CALL_FLAG_BRIDGE_CHECK     = 128,  /*!< internal, we already do check for bridge loop */
     CALL_FLAG_MULTIPARTY       = 256,  /*!< internal, CLCC mpty is 1 */
     CALL_FLAG_DIRECTION        = 512,  /*!< call direction */
-    CALL_FLAG_LOCAL_CHANNEL    = 1024, /*!< local channel flag */
-    CALL_FLAG_INTERNAL_REQUEST = 2048  /*!< internal request */
+    CALL_FLAG_LOCAL_CHANNEL    = 1024,  /*!< local channel flag */
+    CALL_FLAG_INTERNAL_REQUEST = 2048,  /*!< internal request */
+    CALL_FLAG_HANGUP_VERIFY    = 4096,  /*!< waiting for the post-hangup AT+CLCC result */
+    CALL_FLAG_HANGUP_CLCC_ALIVE = 8192, /*!< verified call appeared in the post-hangup AT+CLCC result */
+    CALL_FLAG_HANGUP_RETRY     = 16384  /*!< one modem hangup retry was already issued */
 } call_flag_t;
 
 #define CALL_DIR_INCOMING 1u
