@@ -3,8 +3,8 @@
  *
  * Delivers incoming SMS (received on SIM and stored in mt_queue) to a SIP
  * endpoint (Flexisip) via res_pjsip MESSAGE, tracks the delivery state in the
- * SMS DB, retries on failure with exponential backoff and serves a small HTTP
- * status page (HTML + JSON) with the delivery queues.
+ * SMS DB, retries on failure with exponential backoff and serves a small
+ * READ-ONLY HTTP page (SIM status + unified SMS history in HTML/JSON).
  */
 
 /* Because ast_config.h expects _GNU_SOURCE for some headers (see at_read.c) */
@@ -36,6 +36,7 @@
 #include "helpers.h" /* fd_write_all() */
 #include "mt_task.h"
 #include "smsdb.h"
+#include "web_util.h"
 
 // ================================================================
 
@@ -630,8 +631,22 @@ static void* mt_retry_threadproc(void* arg)
 }
 
 // ================================================================
-// Mini web: GET / -> HTML tables, GET /json -> JSON
+// Mini web: read-only SIM status + SMS history
+//   GET /                   SIM status cards + recent SMS (paged)
+//   GET /sms                index of per-SIM SMS pages
+//   GET /sms/<sim>          SMS history of one SIM (paged, HTML)
+//   GET /sms/<sim>.json     SMS history of one SIM (paged, JSON)
+//   GET /status.json        read-only SIM status (JSON)
+//   GET /json               legacy SMS JSON (mt_queue + mt_out)
+// Only GET is accepted (anything else -> 405); unknown paths -> 404.
+// No control/management endpoints are exposed.
 // ================================================================
+
+#define MT_WEB_PAGE_SIZE 10 /*!< SMS rows shown per page */
+
+/*! Max length of the /sms/<sim> device-name tail we accept (device ids are
+ * DEVNAMELEN=31 in practice; keep a little headroom). */
+#define MT_WEB_SIM_MAX 64
 
 static void mt_web_send(int client_fd, const char* status, const char* ctype, const char* body, int body_len)
 {
@@ -677,77 +692,554 @@ static void mt_html_escape(struct ast_str** buf, const char* in)
     }
 }
 
-struct mt_html_ctx {
-    struct ast_str* buf;
+/*! Percent-encode \a in for use inside an href (path segment, no query). */
+static void mt_web_url_escape(struct ast_str** buf, const char* in)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    if (!in) {
+        return;
+    }
+    for (const unsigned char* p = (const unsigned char*)in; *p; ++p) {
+        const unsigned char c = *p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+            ast_str_append(buf, 0, "%c", c);
+        } else {
+            ast_str_append(buf, 0, "%%%c%c", hex[c >> 4], hex[c & 0x0F]);
+        }
+    }
+}
+
+/*! Human readable RSSI dBm text; "unknown" when there is no usable signal. */
+static void mt_web_rssi_dbm(int rssi, char* out, size_t len)
+{
+    RAII_VAR(struct ast_str*, s, (rssi > 0 && rssi < 32) ? rssi2dBm(rssi) : NULL, ast_free);
+
+    if (s) {
+        ast_copy_string(out, ast_str_buffer(s), len);
+        return;
+    }
+    ast_copy_string(out, "unknown", len);
+}
+
+/*! Visual 0-4 signal bars (four slots, filled ones via the .on class). */
+static void mt_web_bars(struct ast_str** buf, int bars)
+{
+    for (int i = 0; i < 4; ++i) {
+        ast_str_append(buf, 0, i < bars ? "<span class=\"bar on\"></span>" : "<span class=\"bar\"></span>");
+    }
+}
+
+/*! Previous/next page navigation for the SMS tables. base is the (already
+ * percent-encoded) path prefix for the page links. */
+static void mt_web_pagination(struct ast_str** buf, const char* base, int page, int pages)
+{
+    ast_str_append(buf, 0, "<div class=\"pager\">");
+    if (page > 1) {
+        ast_str_append(buf, 0, "<a href=\"%s?page=%d\">&laquo; prev</a> ", base, page - 1);
+    } else {
+        ast_str_append(buf, 0, "<span class=\"off\">&laquo; prev</span> ");
+    }
+    ast_str_append(buf, 0, "page %d / %d ", page, pages);
+    if (page < pages) {
+        ast_str_append(buf, 0, "<a href=\"%s?page=%d\">next &raquo;</a>", base, page + 1);
+    } else {
+        ast_str_append(buf, 0, "<span class=\"off\">next &raquo;</span>");
+    }
+    ast_str_append(buf, 0, "</div>");
+}
+
+/*! Key/value row for the SIM status card; k is a static literal, v is escaped. */
+static void mt_web_kv(struct ast_str** buf, const char* k, const char* v)
+{
+    ast_str_append(buf, 0, "<tr><th>%s</th><td>", k);
+    mt_html_escape(buf, v);
+    ast_str_append(buf, 0, "</td></tr>");
+}
+
+static void mt_web_html_head(struct ast_str** buf, const char* title)
+{
+    ast_str_append(buf, 0,
+                   "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>%s</title>"
+                   "<style>"
+                   "body{font-family:sans-serif;margin:1em}"
+                   "a{color:#06c}"
+                   ".nav{font-size:0.9em;margin:0.2em 0}"
+                   ".hint{color:#555;font-size:0.85em}"
+                   ".sim{border:1px solid #bbb;border-radius:6px;padding:0 1em 0.5em;margin-bottom:1em;max-width:64em}"
+                   ".sim h3{margin:0.5em 0 0.3em}"
+                   ".sim a.small{font-size:0.8em}"
+                   ".state{font-size:0.8em;color:#fff;background:#4682b4;border-radius:3px;padding:1px 6px}"
+                   "table{border-collapse:collapse;margin:0.5em 0 1em}"
+                   "th,td{border:1px solid #999;padding:4px 8px;text-align:left;vertical-align:top}"
+                   "th{background:#eee}"
+                   "table.kv th{width:13em}"
+                   "table.kv th,table.kv td{border:none;border-bottom:1px dotted #ccc;padding:2px 6px}"
+                   ".bar{display:inline-block;width:8px;height:12px;background:#ddd;margin-right:2px;border:1px solid #bbb}"
+                   ".bar.on{background:#4caf50;border-color:#2e7d32}"
+                   ".dir{font-size:0.85em;white-space:nowrap;padding:1px 4px;border-radius:3px}"
+                   ".dir.mt{background:#e3f2fd;color:#1565c0}"
+                   ".dir.mo{background:#fff3e0;color:#e65100}"
+                   ".pager{margin:0.5em 0 1.5em}"
+                   ".pager .off{color:#999}"
+                   ".empty{color:#777}"
+                   "</style></head><body>", title);
+}
+
+static void mt_web_nav(struct ast_str** buf)
+{
+    ast_str_append(buf, 0,
+                   "<p class=\"nav\"><a href=\"/\">SIM status</a> | <a href=\"/sms\">SMS history</a> | "
+                   "<a href=\"/status.json\">Status JSON</a> | <a href=\"/json\">SMS JSON</a></p>");
+}
+
+/*! Parse and validate the ?page= query parameter (default/clamped to >= 1). */
+static int mt_web_page_param(const char* query)
+{
+    int page = 1;
+    char buf[32];
+
+    if (web_util_query_param(query, "page", buf, sizeof(buf)) == 0 && web_util_parse_int(buf, &page) == 0 && page >= 1) {
+        return page;
+    }
+    return 1;
+}
+
+struct mt_web_sms_ctx {
+    struct ast_str** buf;
 };
 
-static int mt_html_queue_cb(void* ctx, const struct smsdb_mt_row* row)
+/*! Row renderer for the unified SMS history (direction explicitly tagged). */
+static int mt_html_sms_cb(void* ctx, const struct sms_paging_row* row)
 {
-    struct ast_str** const buf = &(((struct mt_html_ctx*)ctx)->buf);
+    struct ast_str** const buf = ((struct mt_web_sms_ctx*)ctx)->buf;
+    const int is_mt = strcmp(row->direction, "mt") == 0;
 
     ast_str_append(buf, 0, "<tr><td>");
     mt_web_ts(buf, row->created_at);
     ast_str_append(buf, 0, "</td><td>");
+    if (is_mt) {
+        ast_str_append(buf, 0, "<span class=\"dir mt\">MT&nbsp;SIM&rarr;SIP</span>");
+    } else {
+        ast_str_append(buf, 0, "<span class=\"dir mo\">MO&nbsp;SIP&rarr;SIM</span>");
+    }
+    ast_str_append(buf, 0, "</td><td>");
     mt_html_escape(buf, row->device);
     ast_str_append(buf, 0, "</td><td>");
-    mt_html_escape(buf, row->from_num);
+    mt_html_escape(buf, row->peer);
     ast_str_append(buf, 0, "</td><td>");
     mt_html_escape(buf, row->msg);
     ast_str_append(buf, 0, "</td><td>");
     mt_html_escape(buf, row->state);
-    ast_str_append(buf, 0, "</td><td>%d</td><td>", row->attempts);
-    mt_html_escape(buf, row->last_result);
     ast_str_append(buf, 0, "</td></tr>");
     return 0;
 }
 
-static int mt_html_out_cb(void* ctx, const struct smsdb_mt_out_row* row)
+/*! Log and send an HTTP 500 after a database error reading SMS history. */
+static void mt_web_db_error(int client_fd, const char* what, const char* ctype, const char* body, int body_len)
 {
-    struct ast_str** const buf = &(((struct mt_html_ctx*)ctx)->buf);
+    ast_log(LOG_ERROR, "mt: web: %s failed, returning HTTP 500\n", what);
+    mt_web_send(client_fd, "500 Internal Server Error", ctype, body, body_len);
+}
 
-    ast_str_append(buf, 0, "<tr><td>");
-    mt_web_ts(buf, row->created_at);
-    ast_str_append(buf, 0, "</td><td>");
-    mt_html_escape(buf, row->device);
-    ast_str_append(buf, 0, "</td><td>");
-    mt_html_escape(buf, row->dst);
-    ast_str_append(buf, 0, "</td><td>");
-    mt_html_escape(buf, row->msg);
-    ast_str_append(buf, 0, "</td><td>");
-    mt_html_escape(buf, row->state);
-    ast_str_append(buf, 0, "</td><td>%d</td><td>%s</td></tr>", row->mr, row->srr_status > 0 ? "srr" : "");
+/*! Render one page of the unified SMS table. device == NULL means all SIMs.
+ * base is the URL prefix for the page links (already percent-encoded).
+ * Returns 0 on success and -1 on a database error; the caller must turn a -1
+ * into an HTTP 500 so a DB failure never looks like a successful empty page. */
+static int mt_web_sms_section(struct ast_str** buf, const char* device, const char* base, int page)
+{
+    struct mt_web_sms_ctx ctx = { buf };
+    int total = 0;
+    int pages = 1;
+    int offset = 0;
+
+    if (smsdb_sms_count(device, &total)) {
+        return -1;
+    }
+    (void)web_util_page_meta(total, MT_WEB_PAGE_SIZE, &page, &pages, &offset);
+    if (total <= 0) {
+        ast_str_append(buf, 0, "<p class=\"empty\">No SMS records.</p>");
+        return 0;
+    }
+    ast_str_append(buf, 0, "<table><tr><th>time</th><th>dir</th><th>device</th><th>peer</th><th>message</th><th>state</th></tr>");
+    if (smsdb_sms_page(device, MT_WEB_PAGE_SIZE, offset, &ctx, mt_html_sms_cb)) {
+        return -1;
+    }
+    ast_str_append(buf, 0, "</table>");
+    mt_web_pagination(buf, base, page, pages);
     return 0;
 }
 
-static void mt_web_html(int client_fd)
+struct mt_status_section_ctx {
+    struct ast_str** buf;
+    int count;
+};
+
+/*! SIM status card renderer (called under a locking-safe snapshot). */
+static int mt_html_status_cb(void* ctx, const struct pvt_status_snapshot* snap)
 {
-    struct mt_html_ctx ctx = { NULL };
+    struct mt_status_section_ctx* const sec = ctx;
+    struct ast_str** const buf = sec->buf;
+    char dbm[32];
+    const int bars = web_util_rssi_bars(snap->rssi);
 
-    RAII_VAR(struct ast_str*, buf, ast_str_create(8192), ast_free);
-    ctx.buf = buf;
+    mt_web_rssi_dbm(snap->rssi, dbm, sizeof(dbm));
 
-    ast_str_append(&buf, 0,
-                   "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>chan_quectel MT</title>"
-                   "<style>body{font-family:sans-serif;margin:1em}table{border-collapse:collapse;margin-bottom:2em}"
-                   "th,td{border:1px solid #999;padding:4px 8px;text-align:left;vertical-align:top}th{background:#eee}"
-                   "</style></head><body>");
-    ast_str_append(&buf, 0, "<p><a href=\"/json\">JSON</a></p>");
+    ast_str_append(buf, 0, "<div class=\"sim\"><h3>");
+    mt_html_escape(buf, snap->name);
+    ast_str_append(buf, 0, " <span class=\"state\">");
+    mt_html_escape(buf, snap->state);
+    ast_str_append(buf, 0, "</span> <a class=\"small\" href=\"/sms/");
+    mt_web_url_escape(buf, snap->name);
+    ast_str_append(buf, 0, "\">SMS history</a></h3><table class=\"kv\">");
 
-    ast_str_append(&buf, 0, "<h2>Incoming (SIM&rarr;SIP) &mdash; mt_queue</h2>");
-    ast_str_append(&buf, 0,
-                   "<table><tr><th>time</th><th>device</th><th>from</th><th>msg</th><th>state</th><th>attempts</th><th>result</th></tr>");
-    smsdb_mt_list(&ctx, mt_html_queue_cb);
-    ast_str_append(&buf, 0, "</table>");
+    ast_str_append(buf, 0, "<tr><th>Link</th><td>");
+    if (!snap->connected) {
+        ast_str_append(buf, 0, "not connected");
+    } else if (!snap->initialized) {
+        ast_str_append(buf, 0, "connected, not initialized");
+    } else {
+        ast_str_append(buf, 0, "connected &amp; initialized");
+    }
+    ast_str_append(buf, 0, "</td></tr>");
 
-    ast_str_append(&buf, 0, "<h2>Outgoing (Android&rarr;SIM) &mdash; mt_out</h2>");
-    ast_str_append(&buf, 0,
-                   "<table><tr><th>time</th><th>device</th><th>dst</th><th>msg</th><th>state</th><th>mr</th><th>srr</th></tr>");
-    smsdb_mt_out_list(&ctx, mt_html_out_cb);
-    ast_str_append(&buf, 0, "</table>");
+    ast_str_append(buf, 0, "<tr><th>Operator / network</th><td>");
+    if (ast_strlen_zero(snap->provider_name) && ast_strlen_zero(snap->network_name) && ast_strlen_zero(snap->short_network_name)) {
+        ast_str_append(buf, 0, "n/a");
+    } else {
+        int first = 1;
+        if (!ast_strlen_zero(snap->provider_name)) {
+            mt_html_escape(buf, snap->provider_name);
+            first = 0;
+        }
+        if (!ast_strlen_zero(snap->network_name)) {
+            if (!first) {
+                ast_str_append(buf, 0, " / ");
+            }
+            mt_html_escape(buf, snap->network_name);
+            first = 0;
+        }
+        if (!ast_strlen_zero(snap->short_network_name)) {
+            if (!first) {
+                ast_str_append(buf, 0, " / ");
+            }
+            mt_html_escape(buf, snap->short_network_name);
+        }
+    }
+    if (snap->operator > 0) {
+        ast_str_append(buf, 0, " (PLMN %d)", snap->operator);
+    }
+    ast_str_append(buf, 0, "</td></tr>");
 
+    ast_str_append(buf, 0, "<tr><th>Access technology</th><td>");
+    mt_html_escape(buf, sys_act2str(snap->act));
+    ast_str_append(buf, 0, "</td></tr>");
+
+    ast_str_append(buf, 0, "<tr><th>Registration</th><td>");
+    mt_html_escape(buf, gsm_regstate2str(snap->gsm_reg_status));
+    ast_str_append(buf, 0, "</td></tr>");
+
+    ast_str_append(buf, 0, "<tr><th>RSSI</th><td>%d, %s ", snap->rssi, dbm);
+    mt_web_bars(buf, bars);
+    ast_str_append(buf, 0, "</td></tr>");
+
+    ast_str_append(buf, 0, "<tr><th>Audio</th><td>");
+    if (ast_strlen_zero(snap->audio_format)) {
+        ast_str_append(buf, 0, "n/a");
+    } else {
+        mt_html_escape(buf, snap->audio_format);
+        ast_str_append(buf, 0, " (16 kHz: %s)", snap->audio_16khz ? "Yes" : "No");
+    }
+    ast_str_append(buf, 0, "</td></tr>");
+
+    if (!ast_strlen_zero(snap->imei)) mt_web_kv(buf, "IMEI", snap->imei);
+    if (!ast_strlen_zero(snap->imsi)) mt_web_kv(buf, "IMSI", snap->imsi);
+    if (!ast_strlen_zero(snap->iccid)) mt_web_kv(buf, "ICCID", snap->iccid);
+    if (!ast_strlen_zero(snap->location_area_code)) mt_web_kv(buf, "Location area code", snap->location_area_code);
+    if (!ast_strlen_zero(snap->cell_id)) mt_web_kv(buf, "Cell ID", snap->cell_id);
+    if (!ast_strlen_zero(snap->band)) mt_web_kv(buf, "Band", snap->band);
+
+    ast_str_append(buf, 0, "</table></div>");
+    sec->count++;
+    return 0;
+}
+
+/*! GET / - SIM status cards + recent SMS (all SIMs, paged). */
+static void mt_web_status_html(int client_fd, int page)
+{
+    struct mt_status_section_ctx sec = { NULL, 0 };
+
+    RAII_VAR(struct ast_str*, buf, ast_str_create(16384), ast_free);
+    sec.buf = &buf;
+
+    mt_web_html_head(&buf, "chan_quectel &mdash; SIM status");
+    mt_web_nav(&buf);
+    ast_str_append(&buf, 0, "<h1>SIM status</h1>");
+    pvt_status_each(&sec, mt_html_status_cb);
+    if (sec.count == 0) {
+        ast_str_append(&buf, 0, "<p class=\"empty\">No SIMs configured.</p>");
+    }
+    ast_str_append(&buf, 0, "<h1>Recent SMS</h1>");
+    if (mt_web_sms_section(&buf, NULL, "/", page)) {
+        mt_web_db_error(client_fd, "SMS history read", "text/plain",
+                        "internal error: SMS database unavailable", sizeof("internal error: SMS database unavailable") - 1);
+        return;
+    }
     ast_str_append(&buf, 0, "</body></html>");
 
     mt_web_send(client_fd, "200 OK", "text/html; charset=utf-8", ast_str_buffer(buf), ast_str_strlen(buf));
+}
+
+/*! SIM table row for GET /sms (links to the per-SIM pages). */
+static int mt_html_sms_index_cb(void* ctx, const struct pvt_status_snapshot* snap)
+{
+    struct ast_str** const buf = (struct ast_str**)ctx;
+
+    ast_str_append(buf, 0, "<tr><td><a href=\"/sms/");
+    mt_web_url_escape(buf, snap->name);
+    ast_str_append(buf, 0, "\">");
+    mt_html_escape(buf, snap->name);
+    ast_str_append(buf, 0, "</a></td><td>");
+    mt_html_escape(buf, snap->state);
+    ast_str_append(buf, 0, "</td><td><a href=\"/sms/");
+    mt_web_url_escape(buf, snap->name);
+    ast_str_append(buf, 0, ".json\">json</a></td></tr>");
+    return 0;
+}
+
+/*! GET /sms - index page with links to every SIM's SMS history. */
+static void mt_web_sms_index_html(int client_fd)
+{
+    RAII_VAR(struct ast_str*, buf, ast_str_create(8192), ast_free);
+
+    mt_web_html_head(&buf, "chan_quectel &mdash; SMS history");
+    mt_web_nav(&buf);
+    ast_str_append(&buf, 0, "<h1>SMS history by SIM</h1>");
+    ast_str_append(&buf, 0, "<table><tr><th>SIM</th><th>state</th><th>json</th></tr>");
+    pvt_status_each(&buf, mt_html_sms_index_cb);
+    ast_str_append(&buf, 0, "</table>");
+    ast_str_append(&buf, 0, "</body></html>");
+
+    mt_web_send(client_fd, "200 OK", "text/html; charset=utf-8", ast_str_buffer(buf), ast_str_strlen(buf));
+}
+
+struct mt_sim_find_ctx {
+    const char* name;
+    int found;
+};
+
+static int mt_sim_find_cb(void* ctx, const struct pvt_status_snapshot* snap)
+{
+    struct mt_sim_find_ctx* const f = ctx;
+
+    if (!strcmp(snap->name, f->name)) {
+        f->found = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/*! True when a SIM with exactly this name is configured. */
+static int mt_web_sim_exists(const char* name)
+{
+    struct mt_sim_find_ctx f = { name, 0 };
+
+    pvt_status_each(&f, mt_sim_find_cb);
+    return f.found;
+}
+
+/*! Parse the /sms/<sim>[.json] tail. Returns 0 and fills sim/is_json on a
+ * well-formed single component (no nested '/', printable identifier only). */
+static int mt_web_parse_sim_path(const char* tail, char* sim, size_t sim_len, int* is_json)
+{
+    const char* const slash = strchr(tail, '/');
+    const char* const dot   = strrchr(tail, '.');
+    const char* p;
+    size_t n;
+
+    if (!is_json || sim_len == 0 || ast_strlen_zero(tail) || slash) {
+        return -1;
+    }
+
+    *is_json = 0;
+    if (dot && strcmp(dot, ".json") == 0) {
+        *is_json = 1;
+        n = (size_t)(dot - tail);
+    } else {
+        n = strlen(tail);
+    }
+
+    if (n == 0 || n >= sim_len) {
+        return -1;
+    }
+    memcpy(sim, tail, n);
+    sim[n] = '\0';
+
+    /* device ids are config-defined identifiers; only accept a printable,
+     * slash-free name so the router never reaches odd paths */
+    for (p = sim; *p; ++p) {
+        const unsigned char c = (unsigned char)*p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*! GET /sms/<sim> - SMS history of a single SIM (paged, HTML). */
+static void mt_web_sms_html(int client_fd, const char* sim, int page)
+{
+    RAII_VAR(struct ast_str*, buf, ast_str_create(16384), ast_free);
+    RAII_VAR(struct ast_str*, base, ast_str_create(64), ast_free);
+
+    ast_str_set(&base, 0, "/sms/");
+    mt_web_url_escape(&base, sim);
+
+    mt_web_html_head(&buf, "chan_quectel &mdash; SMS per SIM");
+    mt_web_nav(&buf);
+    ast_str_append(&buf, 0, "<h1>SMS history for SIM ");
+    mt_html_escape(&buf, sim);
+    ast_str_append(&buf, 0, "</h1>");
+    ast_str_append(&buf, 0, "<p class=\"nav\"><a href=\"");
+    mt_html_escape(&buf, ast_str_buffer(base));
+    ast_str_append(&buf, 0, ".json\">JSON for this SIM</a></p>");
+    if (mt_web_sms_section(&buf, sim, ast_str_buffer(base), page)) {
+        mt_web_db_error(client_fd, "SMS history read", "text/plain",
+                        "internal error: SMS database unavailable", sizeof("internal error: SMS database unavailable") - 1);
+        return;
+    }
+    ast_str_append(&buf, 0, "</body></html>");
+
+    mt_web_send(client_fd, "200 OK", "text/html; charset=utf-8", ast_str_buffer(buf), ast_str_strlen(buf));
+}
+
+struct mt_status_json_ctx {
+    struct ast_json* arr;
+};
+
+/*! Status object builder for GET /status.json (locking-safe snapshot). */
+static int mt_json_status_cb(void* ctx, const struct pvt_status_snapshot* snap)
+{
+    struct ast_json* const j = ast_json_object_create();
+    char dbm[32];
+
+    mt_web_rssi_dbm(snap->rssi, dbm, sizeof(dbm));
+
+    ast_json_object_set(j, "name", ast_json_string_create(snap->name));
+    ast_json_object_set(j, "state", ast_json_string_create(snap->state));
+    ast_json_object_set(j, "connected", ast_json_boolean(snap->connected));
+    ast_json_object_set(j, "initialized", ast_json_boolean(snap->initialized));
+    ast_json_object_set(j, "gsm_reg_status", ast_json_integer_create(snap->gsm_reg_status));
+    ast_json_object_set(j, "gsm_registration", ast_json_string_create(gsm_regstate2str_json(snap->gsm_reg_status)));
+    ast_json_object_set(j, "act", ast_json_integer_create(snap->act));
+    ast_json_object_set(j, "access_technology", ast_json_string_create(sys_act2str(snap->act)));
+    ast_json_object_set(j, "rssi", ast_json_integer_create(snap->rssi));
+    ast_json_object_set(j, "rssi_dbm", ast_json_string_create(dbm));
+    ast_json_object_set(j, "rssi_bars", ast_json_integer_create(web_util_rssi_bars(snap->rssi)));
+    ast_json_object_set(j, "audio_format", ast_json_string_create(snap->audio_format));
+    ast_json_object_set(j, "audio_16khz", ast_json_boolean(snap->audio_16khz));
+    if (snap->operator > 0) {
+        struct ast_json* const plmn = ast_json_object_create();
+        ast_json_object_set(plmn, "value", ast_json_integer_create(snap->operator));
+        ast_json_object_set(plmn, "mcc", ast_json_integer_create(snap->operator / 100));
+        ast_json_object_set(plmn, "mnc", ast_json_stringf("%02d", snap->operator % 100));
+        ast_json_object_set(j, "plmn", plmn);
+    }
+    if (!ast_strlen_zero(snap->imei)) ast_json_object_set(j, "imei", ast_json_string_create(snap->imei));
+    if (!ast_strlen_zero(snap->imsi)) ast_json_object_set(j, "imsi", ast_json_string_create(snap->imsi));
+    if (!ast_strlen_zero(snap->iccid)) ast_json_object_set(j, "iccid", ast_json_string_create(snap->iccid));
+    if (!ast_strlen_zero(snap->location_area_code)) ast_json_object_set(j, "lac", ast_json_string_create(snap->location_area_code));
+    if (!ast_strlen_zero(snap->cell_id)) ast_json_object_set(j, "cell_id", ast_json_string_create(snap->cell_id));
+    if (!ast_strlen_zero(snap->band)) ast_json_object_set(j, "band", ast_json_string_create(snap->band));
+
+    ast_json_array_append(((struct mt_status_json_ctx*)ctx)->arr, j);
+    return 0;
+}
+
+/*! GET /status.json - read-only status of all SIMs. */
+static void mt_web_status_json(int client_fd)
+{
+    struct mt_status_json_ctx ctx = { ast_json_array_create() };
+
+    if (!ctx.arr) {
+        mt_web_send(client_fd, "500 Internal Server Error", "text/plain", "json error", 10);
+        return;
+    }
+    pvt_status_each(&ctx, mt_json_status_cb);
+
+    RAII_VAR(struct ast_json*, root, ast_json_object_create(), ast_json_unref);
+    ast_json_object_set(root, "sims", ctx.arr);
+
+    char* const s = ast_json_dump_string_format(root, AST_JSON_PRETTY);
+    mt_web_send(client_fd, "200 OK", "application/json", s ? s : "{}", s ? strlen(s) : 2);
+    ast_json_free(s);
+}
+
+struct mt_sms_json_ctx {
+    struct ast_json* arr;
+};
+
+/*! Item builder for GET /sms/<sim>.json (direction explicitly tagged). */
+static int mt_json_sms_cb(void* ctx, const struct sms_paging_row* row)
+{
+    struct ast_json* const j = ast_json_object_create();
+    const int is_mt = strcmp(row->direction, "mt") == 0;
+
+    ast_json_object_set(j, "direction", ast_json_string_create(row->direction));
+    ast_json_object_set(j, "type", ast_json_string_create(is_mt ? "incoming" : "outgoing"));
+    ast_json_object_set(j, "device", ast_json_string_create(row->device));
+    if (is_mt) {
+        ast_json_object_set(j, "mid", ast_json_string_create(row->ref_id));
+        ast_json_object_set(j, "from", ast_json_string_create(row->peer));
+    } else {
+        ast_json_object_set(j, "mt_out_id", ast_json_integer_create(row->id));
+        ast_json_object_set(j, "dst", ast_json_string_create(row->peer));
+    }
+    ast_json_object_set(j, "msg", ast_json_string_create(row->msg));
+    ast_json_object_set(j, "ts", ast_json_string_create(row->ts));
+    ast_json_object_set(j, "state", ast_json_string_create(row->state));
+    ast_json_object_set(j, "created_at", ast_json_integer_create(row->created_at));
+    ast_json_array_append(((struct mt_sms_json_ctx*)ctx)->arr, j);
+    return 0;
+}
+
+/*! GET /sms/<sim>.json?page=N - validated paginated SMS JSON for one SIM. */
+static void mt_web_sms_json(int client_fd, const char* sim, int page)
+{
+    struct mt_sms_json_ctx ctx = { ast_json_array_create() };
+    int total = 0;
+    int pages = 1;
+    int offset = 0;
+
+    if (!ctx.arr) {
+        mt_web_send(client_fd, "500 Internal Server Error", "text/plain", "json error", 10);
+        return;
+    }
+    if (smsdb_sms_count(sim, &total)) {
+        ast_json_unref(ctx.arr);
+        mt_web_db_error(client_fd, "SMS count read", "application/json",
+                        "{\"error\":\"sms database unavailable\"}", sizeof("{\"error\":\"sms database unavailable\"}") - 1);
+        return;
+    }
+    (void)web_util_page_meta(total, MT_WEB_PAGE_SIZE, &page, &pages, &offset);
+    if (smsdb_sms_page(sim, MT_WEB_PAGE_SIZE, offset, &ctx, mt_json_sms_cb)) {
+        ast_json_unref(ctx.arr);
+        mt_web_db_error(client_fd, "SMS history read", "application/json",
+                        "{\"error\":\"sms database unavailable\"}", sizeof("{\"error\":\"sms database unavailable\"}") - 1);
+        return;
+    }
+
+    RAII_VAR(struct ast_json*, root, ast_json_object_create(), ast_json_unref);
+    ast_json_object_set(root, "sim", ast_json_string_create(sim));
+    ast_json_object_set(root, "page", ast_json_integer_create(page));
+    ast_json_object_set(root, "page_size", ast_json_integer_create(MT_WEB_PAGE_SIZE));
+    ast_json_object_set(root, "total", ast_json_integer_create(total));
+    ast_json_object_set(root, "pages", ast_json_integer_create(pages));
+    ast_json_object_set(root, "items", ctx.arr);
+
+    char* const s = ast_json_dump_string_format(root, AST_JSON_PRETTY);
+    mt_web_send(client_fd, "200 OK", "application/json", s ? s : "{}", s ? strlen(s) : 2);
+    ast_json_free(s);
 }
 
 struct mt_json_ctx {
@@ -822,6 +1314,7 @@ static void mt_web_serve_client(int client_fd)
     char req[2048];
     char method[16] = "";
     char path[512]  = "";
+    char* query = NULL;
     ssize_t n;
     int ms  = 3000;
     int exception = 0;
@@ -852,18 +1345,36 @@ static void mt_web_serve_client(int client_fd)
         return;
     }
 
-    /* strip any query string */
+    /* split off the query string; keep it for the ?page= parameter */
     char* const q = strchr(path, '?');
     if (q) {
         *q = '\0';
+        query = q + 1;
     }
 
     if (strcasecmp(method, "GET") != 0) {
         mt_web_send(client_fd, "405 Method Not Allowed", "text/plain", "method not allowed", 19);
     } else if (!strcmp(path, "/json")) {
+        /* legacy SMS JSON: mt_queue + mt_out, contract unchanged */
         mt_web_json(client_fd);
-    } else if (!strcmp(path, "/") || ast_strlen_zero(path)) {
-        mt_web_html(client_fd);
+    } else if (!strcmp(path, "/status.json")) {
+        mt_web_status_json(client_fd);
+    } else if (!strcmp(path, "/")) {
+        mt_web_status_html(client_fd, mt_web_page_param(query));
+    } else if (!strcmp(path, "/sms")) {
+        mt_web_sms_index_html(client_fd);
+    } else if (ast_begins_with(path, "/sms/")) {
+        const int page = mt_web_page_param(query);
+        char sim[MT_WEB_SIM_MAX];
+        int is_json = 0;
+        if (mt_web_parse_sim_path(path + (sizeof("/sms/") - 1), sim, sizeof(sim), &is_json) != 0 || !mt_web_sim_exists(sim)) {
+            /* unknown SIM or malformed path -> 404 */
+            mt_web_send(client_fd, "404 Not Found", "text/plain", "not found", 9);
+        } else if (is_json) {
+            mt_web_sms_json(client_fd, sim, page);
+        } else {
+            mt_web_sms_html(client_fd, sim, page);
+        }
     } else {
         mt_web_send(client_fd, "404 Not Found", "text/plain", "not found", 9);
     }

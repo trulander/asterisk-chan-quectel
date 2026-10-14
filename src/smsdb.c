@@ -111,6 +111,9 @@ DEFINE_SQL_STATEMENT(list_mt_out,
                      "SELECT id, device, dst, msg, ts, state, srr_status, mr, imdn_id, created_at, updated_at "
                      "FROM mt_out ORDER BY created_at DESC, id DESC")
 
+// OPER: unified SMS history (mt_queue MT + mt_out MO) is implemented by
+// src/sms_paging.c (a pure SQLite module shared with the unit test).
+
 static sqlite3* smsdb;
 
 static int set_ast_str(sqlite3_stmt* stmt, int colno, struct ast_str** str)
@@ -1521,6 +1524,41 @@ int smsdb_mt_out_list(void* ctx, smsdb_mt_out_list_cb cb)
     }
 
     return (res == SQLITE_DONE) ? 0 : -1;
+}
+
+// ================================================================
+// Unified SMS history (mini-web): MT (incoming SIM->SIP) + MO (outgoing SIP->SIM)
+// The SQL/bind/row-read logic lives in src/sms_paging.c (pure SQLite module
+// shared with the unit test); these wrappers run it on the module's
+// (mutex-protected) connection and log failures for the mini-web HTTP layer.
+// ================================================================
+
+int smsdb_sms_page(const char* device, int page_size, int offset, void* ctx, smsdb_sms_list_cb cb)
+{
+    int res;
+
+    SCOPED_DB(smsdb);
+
+    res = sms_paging_page(smsdb, device, page_size, offset, ctx, cb);
+    if (res) {
+        ast_log(LOG_ERROR, "smsdb: unified SMS page failed (device=%s): [%d] %s\n",
+                (device && !ast_strlen_zero(device)) ? device : "(all)", sqlite3_errcode(smsdb), sqlite3_errmsg(smsdb));
+    }
+    return res;
+}
+
+int smsdb_sms_count(const char* device, int* total)
+{
+    int res;
+
+    SCOPED_DB(smsdb);
+
+    res = sms_paging_count(smsdb, device, total);
+    if (res) {
+        ast_log(LOG_ERROR, "smsdb: unified SMS count failed (device=%s): [%d] %s\n",
+                (device && !ast_strlen_zero(device)) ? device : "(all)", sqlite3_errcode(smsdb), sqlite3_errmsg(smsdb));
+    }
+    return res;
 }
 
 int smsdb_vacuum_into(const char* backup_file)

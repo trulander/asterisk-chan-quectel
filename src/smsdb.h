@@ -6,6 +6,7 @@
 #define CHAN_QUECTEL_SMSDB_H_INCLUDED
 
 #include "dc_config.h" /* DEVNAMELEN */
+#include "sms_paging.h" /* struct sms_paging_row / unified SMS history */
 
 #define MT_MID_LEN 128
 #define MT_STATE_LEN 32
@@ -72,5 +73,26 @@ int smsdb_mt_out_find_by_mr(const char* device, const char* dst, int mr, int* id
 int smsdb_mt_out_get_imdn_id(int id, char* out, size_t len);
 typedef int (*smsdb_mt_out_list_cb)(void* ctx, const struct smsdb_mt_out_row* row);
 int smsdb_mt_out_list(void* ctx, smsdb_mt_out_list_cb cb);
+
+/*! Unified SMS history visitor: one entry per SMS, with the direction
+    explicitly tagged ('mt' = incoming SIM->SIP from mt_queue; 'mo' = outgoing
+    SIP->SIM from mt_out). The individual MT and MO records keep their own,
+    separate record shape (see struct smsdb_mt_row / smsdb_mt_out_row); the
+    unified paging view is defined by sms_paging.h. */
+typedef int (*smsdb_sms_list_cb)(void* ctx, const struct sms_paging_row* row);
+
+/*! List one page of the unified SMS history (MT and MO merged, newest first).
+    \param device device name to filter, or NULL for all devices
+    \param page_size max items per page (> 0)
+    \param offset 0-based row offset (already validated by the caller)
+    \param ctx context passed to \a cb
+    \param cb row visitor; returning non-zero stops iteration
+    \return 0 on success, -1 on error */
+int smsdb_sms_page(const char* device, int page_size, int offset, void* ctx, smsdb_sms_list_cb cb);
+
+/*! Total number of SMS records (MT and MO) for a device, or all devices when
+    \a device is NULL.
+    \return 0 on success and stores the count in *total, -1 on error */
+int smsdb_sms_count(const char* device, int* total);
 
 #endif

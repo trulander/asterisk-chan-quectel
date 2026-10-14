@@ -27,7 +27,9 @@ set(SRC_FILES
     pdu.c
     ringbuffer.c
     smsdb.c
+    sms_paging.c
     tty.c
+    web_util.c
 )
 
 add_library(asterisk-chan-quectel SHARED ${SRC_FILES})

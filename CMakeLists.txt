@@ -54,3 +54,7 @@ target_compile_definitions(AsteriskModule INTERFACE
 )
 
 add_subdirectory(src)
+
+# Unit tests (pure C/SQLite helpers, no Asterisk runtime needed).
+enable_testing()
+add_subdirectory(test)

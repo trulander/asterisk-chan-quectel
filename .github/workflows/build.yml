@@ -26,6 +26,10 @@ jobs:
           cmake -B build -DCMAKE_INSTALL_PREFIX=/usr
           cmake --build build -j$(nproc)
 
+      - name: test
+        run: |
+          ctest --test-dir build --output-on-failure
+
       - name: package
         run: cmake --build build --target package
 

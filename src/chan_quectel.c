@@ -1107,6 +1107,63 @@ void pvt_get_status(const struct pvt* const pvt, struct ast_json* status)
     }
 }
 
+#/* */
+
+/*! Snapshot a single pvt into a plain struct under its lock; used by the
+    read-only mini-web thread which must never read modem fields unlocked. */
+static void pvt_status_snapshot_fill(const struct pvt* const pvt, struct pvt_status_snapshot* snap)
+{
+    const struct ast_format* const fmt = pvt_get_audio_format(pvt);
+
+    memset(snap, 0, sizeof(*snap));
+    ast_copy_string(snap->name, PVT_ID(pvt), sizeof(snap->name));
+    ast_copy_string(snap->state, pvt_str_state(pvt), sizeof(snap->state));
+    snap->connected       = pvt->connected ? 1 : 0;
+    snap->initialized     = pvt->initialized ? 1 : 0;
+    snap->gsm_reg_status  = pvt->gsm_reg_status;
+    snap->act             = pvt->act;
+    snap->operator        = pvt->operator;
+    snap->rssi            = pvt->rssi;
+    ast_copy_string(snap->network_name, S_OR(pvt->network_name, ""), sizeof(snap->network_name));
+    ast_copy_string(snap->short_network_name, S_OR(pvt->short_network_name, ""), sizeof(snap->short_network_name));
+    ast_copy_string(snap->provider_name, S_OR(pvt->provider_name, ""), sizeof(snap->provider_name));
+    ast_copy_string(snap->imei, S_OR(pvt->imei, ""), sizeof(snap->imei));
+    ast_copy_string(snap->imsi, S_OR(pvt->imsi, ""), sizeof(snap->imsi));
+    ast_copy_string(snap->iccid, S_OR(pvt->iccid, ""), sizeof(snap->iccid));
+    ast_copy_string(snap->location_area_code, S_OR(pvt->location_area_code, ""), sizeof(snap->location_area_code));
+    ast_copy_string(snap->cell_id, S_OR(pvt->cell_id, ""), sizeof(snap->cell_id));
+    ast_copy_string(snap->band, S_OR(pvt->band, ""), sizeof(snap->band));
+    ast_copy_string(snap->audio_format, S_OR(ast_format_get_name(fmt), ""), sizeof(snap->audio_format));
+    snap->audio_16khz = CONF_UNIQ(pvt, slin16) ? 1 : 0;
+}
+
+int pvt_status_each(void* ctx, pvt_status_cb cb)
+{
+    struct pvt* pvt;
+
+    if (!cb) {
+        return -1;
+    }
+
+    /* The module stops the web thread (mt_task_stop) before destroying any
+     * pvt, so gpublic->devices stays valid for the whole iteration. */
+    AST_RWLIST_RDLOCK(&gpublic->devices);
+    AST_RWLIST_TRAVERSE(&gpublic->devices, pvt, entry) {
+        struct pvt_status_snapshot snap;
+
+        ast_mutex_lock(&pvt->lock);
+        pvt_status_snapshot_fill(pvt, &snap);
+        ast_mutex_unlock(&pvt->lock);
+
+        if (cb(ctx, &snap)) {
+            AST_RWLIST_UNLOCK(&gpublic->devices);
+            return 0;
+        }
+    }
+    AST_RWLIST_UNLOCK(&gpublic->devices);
+    return 0;
+}
+
 /* Module */
 
 static struct pvt* pvt_create(const pvt_config_t* settings)

@@ -215,6 +215,36 @@ const char* pvt_str_call_dir(const struct pvt* pvt);
 
 void pvt_get_status(const struct pvt* const pvt, struct ast_json* status);
 
+/*! Plain copy of the modem status fields needed by the read-only mini-web.
+    Filled under the pvt lock, safe to read from the web thread. */
+struct pvt_status_snapshot {
+    char name[DEVNAMELEN];
+    char state[64];
+    int connected;       /*!< 1 when a connection to the device exists */
+    int initialized;     /*!< 1 when a service level connection exists */
+    int gsm_reg_status;  /*!< raw GSM registration status (AT+CREG) */
+    int act;             /*!< access technology (sys_act2str) */
+    int operator;        /*!< registered PLMN numeric (mcc*100+mnc) */
+    int rssi;            /*!< raw RSSI index (0..31, 99 unknown) */
+    char network_name[64];
+    char short_network_name[64];
+    char provider_name[64];
+    char imei[64];
+    char imsi[64];
+    char iccid[64];
+    char location_area_code[64];
+    char cell_id[64];
+    char band[64];
+    char audio_format[32]; /*!< e.g. "slin", "slin16", "slin48" */
+    int audio_16khz;       /*!< 1 when 16 kHz audio is enabled */
+};
+typedef int (*pvt_status_cb)(void* ctx, const struct pvt_status_snapshot* snap);
+
+/*! Visit every configured device in stable config order with a locking-safe
+    snapshot of its status (the pvt lock is held only during the copy).
+    Return 0. A non-zero return from \a cb stops iteration early. */
+int pvt_status_each(void* ctx, pvt_status_cb cb);
+
 void pvt_on_create_1st_channel(struct pvt* pvt);
 void pvt_on_remove_last_channel(struct pvt* pvt);
 void pvt_reload(restate_time_t when);

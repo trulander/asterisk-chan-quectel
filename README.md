@@ -365,6 +365,55 @@ Supported modules:
     This command just sends `AT+QPCMV=0` and `AT+CFUN=1,1` commands.
     It is helpful if you change `TTY` mode to `UAC` or vice versa.
 
+## Mini HTTP status page (read-only)
+
+When `mt_web_enabled=yes` (default) the module serves a small **read-only** HTTP page on
+`mt_web_bind:mt_web_port` (default `0.0.0.0:8899`). It only displays status and SMS history;
+it has **no** control/management endpoints (no POST/PUT/DELETE, no AT pass-through).
+
+Routes:
+
+| Route | Description |
+| :---- | :---------- |
+| `GET /` | Status cards for every SIM (state, operator/network, access technology, registration, RSSI index + dBm + 0-4 bars, audio format / 16 kHz, safe diagnostics: IMEI/IMSI/ICCID/LAC/cell/band when present) plus the most recent SMS across all SIMs |
+| `GET /sms` | Index page with links to each SIM's SMS history |
+| `GET /sms/<sim>` | SMS history of one SIM (HTML), 10 per page, latest first |
+| `GET /sms/<sim>.json?page=N` | Same history as JSON with validated `page`/`page_size`/`total`/`pages` and `items` |
+| `GET /status.json` | Read-only SIM status as JSON (`{"sims": [...]}`) |
+| `GET /json` | Legacy SMS JSON (`mt_queue` + `mt_out`, contract unchanged) |
+
+Any other path returns `404 Not Found`; any method other than `GET` returns `405 Method Not Allowed`.
+
+The SMS history unifies both delivery directions and tags each record explicitly:
+
+* “MT” / `direction: "mt"` / `type: "incoming"` — incoming SMS **SIM → SIP** (`mt_queue`);
+* “MO” / `direction: "mo"` / `type: "outgoing"` — outgoing SMS **SIP → SIM** (`mt_out`).
+
+Pagination is via `?page=N` (default `1`, values are validated and clamped to the last page;
+10 rows per page). If the SMS database cannot be read, the HTML pages and the JSON endpoint
+return `500 Internal Server Error` (with a log line) instead of a misleading empty success page.
+The signal scale maps GSM RSSI to 0-4 bars: 0 bars for unknown/99/0, 1 for 1-9,
+2 for 10-14, 3 for 15-19, 4 for 20-31 (the exact dBm value is always shown next to the bars).
+All dynamic strings are HTML-escaped and the modem state is read through a locked snapshot.
+
+## Tests
+
+The pure (non-Asterisk) helper modules have CTest unit tests that build with the normal CMake
+configure and run via `ctest` in CI:
+
+```sh
+cmake -B build -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
+```
+
+* `web_util_test` covers RSSI bar thresholds, strict integer / `?page=` parsing, page clamping
+  and pagination math and query-parameter extraction (`src/web_util.c`).
+* `sms_paging_test` covers the unified SMS history pagination against an in-memory SQLite
+  database with the real `smsdb` schema: per-SIM filtering/isolation, MT/MO direction and field
+  mapping, newest-first ordering, count/page metadata and page slicing, empty results vs. real
+  database errors (`src/sms_paging.c`, shared by `smsdb.c`).
+
 ## Internal
 
 * *UCS-2* encoding is mandatory now.
