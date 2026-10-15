@@ -186,11 +186,6 @@ void pvt_disconnect(struct pvt* pvt)
     pvt->initialized      = 0;
     pvt->has_call_waiting = 0;
 
-    /* leave cfun_soft_reset_count alone: the soft-reset budget spans the whole
-       init session (only a successful init resets it), so a wedged SIM does
-       not loop forever across monitor restarts */
-    pvt->cfun_soft_reset_pending = 0;
-
     /* FIXME: LOST real device state */
     pvt->dialing            = 0;
     pvt->ring               = 0;

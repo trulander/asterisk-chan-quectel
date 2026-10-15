@@ -235,8 +235,6 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
             }
             at_enqueue_csq(task->cpvt);
             pvt->initialized = 1;
-            /* successful init closes the current soft-reset session */
-            pvt->cfun_soft_reset_count = 0;
             break;
 
         case CMD_AT_COPS_INIT:
@@ -345,18 +343,6 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
             pvt->ring     = 0;
             pvt->dialing  = 0;
             pvt->cwaiting = 0;
-            break;
-
-        case CMD_AT_CFUN0:
-            at_ok_response_dbg(2, pvt, ecmd, "Radio powered off (soft modem reset)");
-            break;
-
-        case CMD_AT_CFUN1:
-            at_ok_response_dbg(2, pvt, ecmd, "Radio powered on after soft modem reset, restarting initialization");
-            pvt->cfun_soft_reset_pending = 0;
-            if (at_enqueue_initialization(&pvt->sys_chan)) {
-                at_ok_response_err(pvt, ecmd, "Could not enqueue initialization after soft modem reset");
-            }
             break;
 
         case CMD_AT_CPCMREG1:
@@ -596,31 +582,6 @@ static void __attribute__((format(printf, 7, 8))) at_err_response_log(int level,
 #define at_err_response_wrn(pvt, ecmd, ...) at_err_response_log(LOG_WARNING, pvt, ecmd, __VA_ARGS__)
 
 /*!
- * \brief Decide whether a failed init command should trigger a soft modem
- * reset (AT+CFUN=0 -> AT+CFUN=1) and arm it when it should.
- *
- * Only used for commands that exist solely in the init sequence (CMD_AT_Z /
- * CMD_AT_CPIN) and only while the device is not yet initialized: ordinary
- * runtime errors never reach soft reset. The AT+CFUN=0/pause/AT+CFUN=1
- * enqueue itself happens in response_taskproc once the failing init task has
- * been dropped from the queue.
- * \return 1 when the soft reset was armed, 0 otherwise (caller falls back to
- * the plain reconnect loop without touching the modem).
- */
-static int at_try_soft_reset(struct pvt* const pvt, const at_queue_cmd_t* const ecmd, const at_res_t at_res)
-{
-    if (at_res == RES_TIMEOUT || pvt->initialized || pvt->cfun_soft_reset_pending || pvt->cfun_soft_reset_count >= PVT_CFUN_SOFT_RESET_LIMIT) {
-        return 0;
-    }
-
-    pvt->cfun_soft_reset_pending = 1;
-    pvt->cfun_soft_reset_count++;
-    at_err_response_wrn(pvt, ecmd, "Init failed; soft modem reset queued (AT+CFUN=0 -> AT+CFUN=1), attempt %u/%u", pvt->cfun_soft_reset_count,
-                        PVT_CFUN_SOFT_RESET_LIMIT);
-    return 1;
-}
-
-/*!
  * \brief Handle ERROR response
  * \param pvt -- pvt structure
  * \retval  0 success
@@ -634,10 +595,7 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
         return 0;
     }
 
-    /* RES_TIMEOUT is the expected "result" of a queue-native pause command
-       (CFUN-pause): allow it through so the switch can advance the queue when
-       the pause elapses. Ordinary commands always expect a real response. */
-    if (!(ecmd->res == RES_OK || ecmd->res == RES_SMS_PROMPT || ecmd->res == RES_TIMEOUT)) {
+    if (!(ecmd->res == RES_OK || ecmd->res == RES_SMS_PROMPT)) {
         at_err_response_err(pvt, ecmd, "Received unexpected [%s], ignoring", at_res2str(at_res));
         return 0;
     }
@@ -645,20 +603,11 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
     switch (ecmd->cmd) {
         /* critical errors */
         case CMD_AT:
+        case CMD_AT_Z:
         case CMD_AT_E:
         case CMD_AT_CLCC:
             at_err_response_err(pvt, ecmd, NULL);
             /* mean disconnected from device */
-            goto e_return;
-
-        case CMD_AT_Z:
-            /* ATZ failure while a SIM is present usually means the SIM detector
-               is stuck; try a soft modem reset (armed here, enqueued once the
-               failing init task is dropped). Nothing to reset -> fall back to
-               the plain reconnect loop. */
-            if (!at_try_soft_reset(pvt, ecmd, at_res)) {
-                at_err_response_err(pvt, ecmd, NULL);
-            }
             goto e_return;
 
         case CMD_AT_FINAL:
@@ -699,12 +648,7 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
             goto e_return;
 
         case CMD_AT_CPIN:
-            /* "SIM not inserted"/not READY on a physically present SIM is the
-               other stuck-SIM symptom during init; same soft reset handling
-               as ATZ (armed here, enqueued once the init task is dropped). */
-            if (!at_try_soft_reset(pvt, ecmd, at_res)) {
-                at_err_response_err(pvt, ecmd, "Error checking PIN state");
-            }
+            at_err_response_err(pvt, ecmd, "Error checking PIN state");
             goto e_return;
 
         case CMD_AT_COPS_INIT:
@@ -760,26 +704,6 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
                 pvt->has_voice = 0;
             }
             break;
-
-        case CMD_AT_CFUN0:
-        case CMD_AT_CFUN1:
-            at_err_response_err(pvt, ecmd, "Soft modem reset failed, disconnecting");
-            pvt->cfun_soft_reset_pending = 0;
-            goto e_return;
-
-        case CMD_AT_CFUN_PAUSE:
-            /* queue-native pause elapsed: power the radio back on and let the
-               AT+CFUN=1 OK handler restart the initialization sequence. */
-            at_err_response_dbg(1, pvt, ecmd, "Soft reset pause elapsed; powering the radio back on");
-            if (at_enqueue_cfun1(&pvt->sys_chan)) {
-                at_err_response_err(pvt, ecmd, "Could not enqueue soft reset completion");
-            }
-            at_queue_handle_result(pvt, at_res);
-            if (at_queue_run(pvt)) {
-                ast_log(LOG_ERROR, "[%s] Fail to send soft reset continuation\n", PVT_ID(pvt));
-                pvt->terminate_monitor = 1;
-            }
-            return 0;
 
         case CMD_AT_CSSN:
             at_err_response_err(pvt, ecmd, "Unable to activate Supplementary Service Notifications");
@@ -3209,16 +3133,6 @@ static void response_taskproc(struct pvt_taskproc_data* ptd)
     PVT_STAT(rtd->ptd.pvt, at_responses)++;
     if (at_response(rtd->ptd.pvt, &rtd->response, at_res)) {
         ast_log(LOG_WARNING, "[%s] Fail to handle response\n", PVT_ID(rtd->ptd.pvt));
-        /* An init failure that armed a soft modem reset in at_response_error
-           (stuck SIM on CMD_AT_Z/CMD_AT_CPIN): the failing init task was
-           already dropped from the queue, so enqueue the AT+CFUN=0/pause/
-           AT+CFUN=1 recovery sequence now. */
-        if (rtd->ptd.pvt->cfun_soft_reset_pending) {
-            rtd->ptd.pvt->cfun_soft_reset_pending = 0;
-            if (at_enqueue_soft_reset(&rtd->ptd.pvt->sys_chan)) {
-                ast_log(LOG_ERROR, "[%s] Could not enqueue soft modem reset\n", PVT_ID(rtd->ptd.pvt));
-            }
-        }
     }
 
     if (at_queue_run(rtd->ptd.pvt)) {

@@ -208,16 +208,6 @@ int at_queue_run(struct pvt* pvt)
     } else {
         at_queue_cmd_t* const cmd = &(t->cmds[t->cindex]);
         if (!cmd->length) {
-            /* A queue-native pause command is never written to the device: it
-               has no payload and its expected result is RES_TIMEOUT, so the
-               monitor simply waits out cmd->timeout and the queue advances on
-               the RES_TIMEOUT result (see cmd_timeout/at_response_error).
-               A regular command that was already written is also length == 0,
-               but its expected result is a real response, so it stays a
-               no-op here. */
-            if (cmd->res == RES_TIMEOUT) {
-                cmd->timeout = ast_tvadd(ast_tvnow(), cmd->timeout);
-            }
             return fail;
         }
 

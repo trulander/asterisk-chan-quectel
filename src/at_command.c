@@ -778,55 +778,6 @@ int at_enqueue_reset(struct cpvt* cpvt)
 }
 
 /*!
- * \brief Enqueue the first half of the soft modem reset (AT+CFUN=0, a
- * queue-native pause, AT+CFUN=1) used to recover a stuck SIM during init.
- * \param cpvt -- cpvt structure
- * \return 0 on success, -1 on error
- */
-int at_enqueue_soft_reset(struct cpvt* cpvt)
-{
-    struct pvt* const pvt = cpvt->pvt;
-    DECLARE_AT_CMD(cfun0, "+CFUN=0");
-
-    /* CFUN-pause is never sent to the modem: it has no payload and expects
-       RES_TIMEOUT, so it just delays the queue by its timeout (see
-       at_queue_run/cmd_timeout). No blocking sleep in the monitor thread. */
-    static const at_queue_cmd_t cmds[] = {
-        ATQ_CMD_DECLARE_ST(CMD_AT_CFUN0, cfun0),
-        ATQ_CMD_DECLARE_DYNFT(CMD_AT_CFUN_PAUSE, RES_TIMEOUT, ATQ_CMD_FLAG_IGNORE, PVT_CFUN_SOFT_RESET_PAUSE_SEC, 0),
-    };
-
-    ast_log(LOG_NOTICE, "[%s] Soft modem reset: queuing AT+CFUN=0, %us pause, AT+CFUN=1\n", PVT_ID(pvt), PVT_CFUN_SOFT_RESET_PAUSE_SEC);
-
-    if (at_queue_insert_const(cpvt, cmds, ARRAY_LEN(cmds), 1)) {
-        chan_quectel_err = E_QUEUE;
-        return -1;
-    }
-
-    return 0;
-}
-
-/*!
- * \brief Enqueue AT+CFUN=1 to power the radio back on after a soft modem
- * reset; its successful reply restarts the normal initialization sequence.
- * \param cpvt -- cpvt structure
- * \return 0 on success, -1 on error
- */
-int at_enqueue_cfun1(struct cpvt* cpvt)
-{
-    DECLARE_AT_CMD(cfun1, "+CFUN=1");
-
-    static const at_queue_cmd_t cmd = ATQ_CMD_DECLARE_ST(CMD_AT_CFUN1, cfun1);
-
-    if (at_queue_insert_const(cpvt, &cmd, 1u, 1)) {
-        chan_quectel_err = E_QUEUE;
-        return -1;
-    }
-
-    return 0;
-}
-
-/*!
  * \brief Enqueue a dial commands
  * \param cpvt -- cpvt structure
  * \param number -- the called number

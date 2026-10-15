@@ -90,14 +90,6 @@ typedef struct pvt_stat {
 
 struct at_queue_task;
 
-/*! Maximum number of soft modem resets (AT+CFUN=0 -> AT+CFUN=1) attempted
-    during one initialization session before giving up and returning to the
-    plain reconnect loop (so a wedged SIM is never masked forever). */
-#define PVT_CFUN_SOFT_RESET_LIMIT 3
-/*! Pause between AT+CFUN=0 and AT+CFUN=1 of the soft reset, in seconds (a
-    queue-native delay, never a blocking sleep in the monitor thread). */
-#define PVT_CFUN_SOFT_RESET_PAUSE_SEC 3
-
 typedef struct pvt {
     AST_LIST_ENTRY(pvt) entry; /*!< linked list pointers */
 
@@ -181,8 +173,6 @@ typedef struct pvt {
     unsigned int terminate_monitor    :1; /*!< non-zero if we want terminate monitor thread i.e. restart, stop, remove */
     unsigned int has_subscriber_number:1; /*!< subscriber_number field is valid */
     unsigned int must_remove          :1; /*!< mean must removed from list: NOT FULLY THREADSAFE */
-    unsigned int cfun_soft_reset_pending:1; /*!< a soft modem reset (CFUN=0->1) is armed/queued for init recovery */
-    unsigned int cfun_soft_reset_count; /*!< soft resets enqueued in the current init session (budget PVT_CFUN_SOFT_RESET_LIMIT) */
 
     volatile dev_state_t desired_state;   /*!< desired state */
     volatile restate_time_t restart_time; /*!< time when change state */
