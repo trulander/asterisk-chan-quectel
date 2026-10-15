@@ -109,6 +109,45 @@ static void seed_mo(sqlite3* db, const char* device, const char* dst, long creat
     exec_sql(db, sql);
 }
 
+/*! MT row with the full delivery/retry column set (attempts/next_retry_at/
+    last_result/sent_at/delivered_at). */
+static void seed_mt_ext(sqlite3* db, const char* device, const char* mid, const char* from_num, long created_at, int attempts, long next_retry_at,
+                        const char* last_result, long sent_at, long delivered_at)
+{
+    char sql[1024];
+
+    snprintf(sql, sizeof(sql),
+             "INSERT INTO mt_queue (device, mid, from_num, msg, created_at, state, attempts, next_retry_at, last_result, sent_at, delivered_at) "
+             "VALUES ('%s','%s','%s','msg-%s',%ld,'delivered',%d,%ld,'%s',%ld,%ld)",
+             device, mid, from_num, mid, created_at, attempts, next_retry_at, last_result, sent_at, delivered_at);
+    exec_sql(db, sql);
+}
+
+/*! MO row with delivery status columns (srr_status/mr); pass -1 for NULL. */
+static void seed_mo_ext(sqlite3* db, const char* device, const char* dst, long created_at, int srr_status, int mr)
+{
+    char sql[512];
+
+    if (srr_status < 0 && mr < 0) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO mt_out (device, dst, msg, created_at) VALUES ('%s','%s','msg-%s',%ld)",
+                 device, dst, dst, created_at);
+    } else if (srr_status < 0) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO mt_out (device, dst, msg, created_at, mr) VALUES ('%s','%s','msg-%s',%ld,%d)",
+                 device, dst, dst, created_at, mr);
+    } else if (mr < 0) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO mt_out (device, dst, msg, created_at, srr_status) VALUES ('%s','%s','msg-%s',%ld,%d)",
+                 device, dst, dst, created_at, srr_status);
+    } else {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO mt_out (device, dst, msg, created_at, srr_status, mr) VALUES ('%s','%s','msg-%s',%ld,%d,%d)",
+                 device, dst, dst, created_at, srr_status, mr);
+    }
+    exec_sql(db, sql);
+}
+
 /*! Key that uniquely identifies one merged row for order/membership checks:
     direction ':' ref_id (mid for MT, "id" text for MO). */
 static void row_key(const struct sms_paging_row* row, char* out, size_t len)
@@ -215,6 +254,96 @@ static void test_seed_and_basics(void)
     sqlite3_close(db);
 }
 
+static void test_extended_columns(void)
+{
+    sqlite3* const db = open_db();
+    struct row_collector c;
+    const char* sim1_all[] = { "mt:me5", "mo:2", "mo:1", "mt:me4", "mt:me3" };
+
+    create_schema(db);
+    /* MT with full delivery/retry columns */
+    seed_mt_ext(db, "sim1", "me3", "+49130", 1310, 1, 1400, "202 accepted (queued)", 1320, 1330);
+    /* MT that was never retried (defaults: attempts 0, next_retry_at 0) */
+    seed_mt(db, "sim1", "me4", "+49130", 1410);
+    /* MT with no report fields (sent/delivered 0, empty last_result) */
+    seed_mt_ext(db, "sim1", "me5", "+49130", 1500, 2, 0, "", 0, 0);
+    /* MO with srr_status + mr */
+    seed_mo_ext(db, "sim1", "+49900", 1420, 0, 0x34);
+    /* MO with no status report yet (srr_status/mr NULL -> -1 sentinels) */
+    seed_mo(db, "sim1", "+49901", 1430);
+
+    memset(&c, 0, sizeof(c));
+    CHECK(sms_paging_page(db, "sim1", 10, 0, &c, collect_row) == 0, "ext page rc");
+    check_rows("page ext (newest first)", &c, sim1_all, 5);
+
+    /* MO row with a real status report: own columns filled, MT columns are
+       the -1 sentinels so the renderer shows an em-dash. */
+    {
+        const struct sms_paging_row* row = NULL;
+        for (int i = 0; i < c.n; i++) {
+            if (strcmp(c.rows[i].direction, "mo") == 0 && strcmp(c.rows[i].ref_id, "1") == 0) {
+                row = &c.rows[i];
+            }
+        }
+        CHECK(row != NULL, "ext: MO row found");
+        if (row) {
+            CHECK(row->srr_status == 0 && row->mr == 0x34, "ext: MO srr_status=%ld mr=%ld, expected 0 / 0x34", row->srr_status, row->mr);
+            CHECK(row->attempts == -1 && row->next_retry_at == -1 && row->sent_at == -1 && row->delivered_at == -1,
+                  "ext: MO MT-column sentinels (%ld/%ld/%ld/%ld)", row->attempts, row->next_retry_at, row->sent_at, row->delivered_at);
+            CHECK(strlen(row->last_result) == 0, "ext: MO last_result empty");
+        }
+    }
+
+    /* MO row with no status report: srr_status/mr fall back to the -1 sentinel. */
+    {
+        const struct sms_paging_row* row = NULL;
+        for (int i = 0; i < c.n; i++) {
+            if (strcmp(c.rows[i].direction, "mo") == 0 && strcmp(c.rows[i].ref_id, "2") == 0) {
+                row = &c.rows[i];
+            }
+        }
+        CHECK(row != NULL, "ext: MO(no report) row found");
+        if (row) {
+            CHECK(row->srr_status == -1 && row->mr == -1, "ext: MO(no report) srr_status=%ld mr=%ld, expected -1", row->srr_status, row->mr);
+        }
+    }
+
+    /* MT rows carry their own columns; the MO-only columns are -1. */
+    {
+        const struct sms_paging_row* row = NULL;
+        for (int i = 0; i < c.n; i++) {
+            if (strcmp(c.rows[i].direction, "mt") == 0 && strcmp(c.rows[i].ref_id, "me3") == 0) {
+                row = &c.rows[i];
+            }
+        }
+        CHECK(row != NULL, "ext: MT row found");
+        if (row) {
+            CHECK(row->attempts == 1 && row->last_result && strcmp(row->last_result, "202 accepted (queued)") == 0,
+                  "ext: MT attempts/last_result");
+            CHECK(row->next_retry_at == 1400 && row->sent_at == 1320 && row->delivered_at == 1330,
+                  "ext: MT retry/sent/delivered (%ld/%ld/%ld)", row->next_retry_at, row->sent_at, row->delivered_at);
+            CHECK(row->srr_status == -1 && row->mr == -1, "ext: MT MO-column sentinels (%ld/%ld)", row->srr_status, row->mr);
+        }
+    }
+
+    /* MT with defaults: attempts 0, next_retry_at 0, empty last_result. */
+    {
+        const struct sms_paging_row* row = NULL;
+        for (int i = 0; i < c.n; i++) {
+            if (strcmp(c.rows[i].direction, "mt") == 0 && strcmp(c.rows[i].ref_id, "me4") == 0) {
+                row = &c.rows[i];
+            }
+        }
+        CHECK(row != NULL, "ext: MT(defaults) row found");
+        if (row) {
+            CHECK(row->attempts == 0 && row->next_retry_at == 0 && row->sent_at == 0 && row->delivered_at == 0 && strlen(row->last_result) == 0,
+                  "ext: MT(defaults) attempts=%ld next=%ld last='%s'", row->attempts, row->next_retry_at, row->last_result);
+        }
+    }
+
+    sqlite3_close(db);
+}
+
 static void test_empty_and_errors(void)
 {
     sqlite3* const db = open_db();
@@ -253,6 +382,7 @@ static void test_empty_and_errors(void)
 int main(void)
 {
     test_seed_and_basics();
+    test_extended_columns();
     test_empty_and_errors();
 
     printf("\n%s: done %d tests: %d OK %d FAILS\n", "sms_paging_test", ok + faults, ok, faults);

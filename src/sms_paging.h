@@ -29,6 +29,7 @@
 #define SMS_PAGING_MSG_LEN   4096
 #define SMS_PAGING_TS_LEN    64
 #define SMS_PAGING_STATE_LEN 32
+#define SMS_PAGING_RESULT_LEN 256 /*!< MT last_result (matches MT_RESULT_LEN) */
 
 /*! Unified SMS history row: one entry per SMS message, with the direction
     explicitly tagged ('mt' = incoming SIM->SIP from mt_queue; 'mo' = outgoing
@@ -45,6 +46,17 @@ struct sms_paging_row {
     char ts[SMS_PAGING_TS_LEN];
     char state[SMS_PAGING_STATE_LEN];
     long created_at;
+
+    /* MT-only (mt_queue) columns; -1/empty mark "no data" for MO rows. */
+    long attempts;                       /*!< MT delivery attempts (0 = not yet retried) */
+    long next_retry_at;                  /*!< MT epoch of the next retry (0 = none) */
+    char last_result[SMS_PAGING_RESULT_LEN]; /*!< MT last delivery attempt result */
+    long sent_at;                        /*!< MT epoch when the message was sent (0 = none) */
+    long delivered_at;                   /*!< MT epoch when the message was delivered (0 = none) */
+
+    /* MO-only (mt_out) columns; -1/empty mark "no data" for MT rows. */
+    long srr_status;                     /*!< MO delivery status report code (-1 = no report yet) */
+    long mr;                             /*!< MO modem message reference (-1 = not stamped) */
 };
 
 typedef int (*sms_paging_row_cb)(void* ctx, const struct sms_paging_row* row);

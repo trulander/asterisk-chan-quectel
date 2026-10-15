@@ -675,6 +675,23 @@ static void mt_web_ts(struct ast_str** buf, long epoch)
     ast_str_append(buf, 0, "%s", tmp);
 }
 
+/*! Append a numeric cell or an em-dash when the value carries no data
+    (sentinels <= 0, or the 99 "unknown" convention). */
+static void mt_web_num_cell(struct ast_str** buf, long v)
+{
+    ast_str_append(buf, 0, (v > 0 && v != 99) ? "%ld" : "&mdash;", v);
+}
+
+/*! Append a formatted epoch time or an em-dash when there is no data. */
+static void mt_web_ts_cell(struct ast_str** buf, long epoch)
+{
+    if (epoch > 0) {
+        mt_web_ts(buf, epoch);
+    } else {
+        ast_str_append(buf, 0, "&mdash;");
+    }
+}
+
 static void mt_html_escape(struct ast_str** buf, const char* in)
 {
     if (!in) {
@@ -790,7 +807,20 @@ static void mt_web_nav(struct ast_str** buf)
 {
     ast_str_append(buf, 0,
                    "<p class=\"nav\"><a href=\"/\">SIM status</a> | <a href=\"/sms\">SMS history</a> | "
-                   "<a href=\"/status.json\">Status JSON</a> | <a href=\"/json\">SMS JSON</a></p>");
+                   "<a href=\"/status.json\">Status JSON</a> | <a href=\"/json\">SMS JSON</a> &nbsp;|&nbsp; "
+                   "<label for=\"mt-refresh\">auto-refresh:</label> "
+                   "<select id=\"mt-refresh\" onchange=\"mt_setRefresh(this.value)\">"
+                   "<option value=\"off\">off</option><option value=\"1\">1s</option>"
+                   "<option value=\"2\">2s</option><option value=\"3\">3s</option>"
+                   "<option value=\"4\">4s</option><option value=\"5\">5s</option>"
+                   "<option value=\"10\">10s</option><option value=\"15\">15s</option>"
+                   "<option value=\"30\">30s</option></select></p>"
+                   "<script>"
+                   "function mt_setRefresh(v){try{localStorage.setItem(\"mt_refresh\",v);}catch(e){}}"
+                   "(function(){var sel=document.getElementById(\"mt-refresh\"),v=\"off\";"
+                   "try{v=localStorage.getItem(\"mt_refresh\")||\"off\";}catch(e){}"
+                   "if(sel)sel.value=v;var n=parseInt(v,10);if(n>0){setTimeout(function(){location.reload();},n*1000);}}" ")();"
+                   "</script>");
 }
 
 /*! Parse and validate the ?page= query parameter (default/clamped to >= 1). */
@@ -809,28 +839,73 @@ struct mt_web_sms_ctx {
     struct ast_str** buf;
 };
 
-/*! Row renderer for the unified SMS history (direction explicitly tagged). */
+/*! Row renderer for the unified SMS history (direction explicitly tagged).
+    The MT/mt_queue and MO/mt_out extra columns are shown in the same table
+    with em-dashes for the columns the row's own direction does not carry. */
 static int mt_html_sms_cb(void* ctx, const struct sms_paging_row* row)
 {
     struct ast_str** const buf = ((struct mt_web_sms_ctx*)ctx)->buf;
     const int is_mt = strcmp(row->direction, "mt") == 0;
 
+    /* time */
     ast_str_append(buf, 0, "<tr><td>");
     mt_web_ts(buf, row->created_at);
-    ast_str_append(buf, 0, "</td><td>");
+    ast_str_append(buf, 0, "</td>");
+    /* direction */
+    ast_str_append(buf, 0, "<td>");
     if (is_mt) {
         ast_str_append(buf, 0, "<span class=\"dir mt\">MT&nbsp;SIM&rarr;SIP</span>");
     } else {
         ast_str_append(buf, 0, "<span class=\"dir mo\">MO&nbsp;SIP&rarr;SIM</span>");
     }
-    ast_str_append(buf, 0, "</td><td>");
+    ast_str_append(buf, 0, "</td>");
+    /* device */
+    ast_str_append(buf, 0, "<td>");
     mt_html_escape(buf, row->device);
-    ast_str_append(buf, 0, "</td><td>");
+    ast_str_append(buf, 0, "</td>");
+    /* peer */
+    ast_str_append(buf, 0, "<td>");
     mt_html_escape(buf, row->peer);
-    ast_str_append(buf, 0, "</td><td>");
+    ast_str_append(buf, 0, "</td>");
+    /* message */
+    ast_str_append(buf, 0, "<td>");
     mt_html_escape(buf, row->msg);
-    ast_str_append(buf, 0, "</td><td>");
+    ast_str_append(buf, 0, "</td>");
+    /* state */
+    ast_str_append(buf, 0, "<td>");
     mt_html_escape(buf, row->state);
+    ast_str_append(buf, 0, "</td>");
+    /* retries */
+    ast_str_append(buf, 0, "<td>");
+    mt_web_num_cell(buf, row->attempts);
+    ast_str_append(buf, 0, "</td>");
+    /* last retry */
+    ast_str_append(buf, 0, "<td>");
+    if (ast_strlen_zero(row->last_result)) {
+        ast_str_append(buf, 0, "&mdash;");
+    } else {
+        mt_html_escape(buf, row->last_result);
+    }
+    ast_str_append(buf, 0, "</td>");
+    /* next retry */
+    ast_str_append(buf, 0, "<td>");
+    mt_web_ts_cell(buf, row->next_retry_at);
+    ast_str_append(buf, 0, "</td>");
+    /* sent */
+    ast_str_append(buf, 0, "<td>");
+    mt_web_ts_cell(buf, row->sent_at);
+    ast_str_append(buf, 0, "</td>");
+    /* delivered */
+    ast_str_append(buf, 0, "<td>");
+    mt_web_ts_cell(buf, row->delivered_at);
+    ast_str_append(buf, 0, "</td>");
+    /* delivery status report code */
+    ast_str_append(buf, 0, "<td>");
+    mt_web_num_cell(buf, row->srr_status);
+    ast_str_append(buf, 0, "</td>");
+    /* mr */
+    ast_str_append(buf, 0, "<td>");
+    mt_web_num_cell(buf, row->mr);
     ast_str_append(buf, 0, "</td></tr>");
     return 0;
 }
@@ -861,7 +936,9 @@ static int mt_web_sms_section(struct ast_str** buf, const char* device, const ch
         ast_str_append(buf, 0, "<p class=\"empty\">No SMS records.</p>");
         return 0;
     }
-    ast_str_append(buf, 0, "<table><tr><th>time</th><th>dir</th><th>device</th><th>peer</th><th>message</th><th>state</th></tr>");
+    ast_str_append(buf, 0, "<table><tr><th>time</th><th>dir</th><th>device</th><th>peer</th><th>message</th>"
+                   "<th>state</th><th>retries</th><th>last retry</th><th>next retry</th>"
+                   "<th>sent</th><th>delivered</th><th>srr status</th><th>mr</th></tr>");
     if (smsdb_sms_page(device, MT_WEB_PAGE_SIZE, offset, &ctx, mt_html_sms_cb)) {
         return -1;
     }
@@ -964,8 +1041,8 @@ static int mt_html_status_cb(void* ctx, const struct pvt_status_snapshot* snap)
     return 0;
 }
 
-/*! GET / - SIM status cards + recent SMS (all SIMs, paged). */
-static void mt_web_status_html(int client_fd, int page)
+/*! GET / - SIM status cards only (SMS history is a separate, per-SIM page). */
+static void mt_web_status_html(int client_fd)
 {
     struct mt_status_section_ctx sec = { NULL, 0 };
 
@@ -978,12 +1055,6 @@ static void mt_web_status_html(int client_fd, int page)
     pvt_status_each(&sec, mt_html_status_cb);
     if (sec.count == 0) {
         ast_str_append(&buf, 0, "<p class=\"empty\">No SIMs configured.</p>");
-    }
-    ast_str_append(&buf, 0, "<h1>Recent SMS</h1>");
-    if (mt_web_sms_section(&buf, NULL, "/", page)) {
-        mt_web_db_error(client_fd, "SMS history read", "text/plain",
-                        "internal error: SMS database unavailable", sizeof("internal error: SMS database unavailable") - 1);
-        return;
     }
     ast_str_append(&buf, 0, "</body></html>");
 
@@ -1179,7 +1250,8 @@ struct mt_sms_json_ctx {
     struct ast_json* arr;
 };
 
-/*! Item builder for GET /sms/<sim>.json (direction explicitly tagged). */
+/*! Item builder for GET /sms/<sim>.json (direction explicitly tagged, with
+    the direction-specific delivery/retry columns). */
 static int mt_json_sms_cb(void* ctx, const struct sms_paging_row* row)
 {
     struct ast_json* const j = ast_json_object_create();
@@ -1199,6 +1271,16 @@ static int mt_json_sms_cb(void* ctx, const struct sms_paging_row* row)
     ast_json_object_set(j, "ts", ast_json_string_create(row->ts));
     ast_json_object_set(j, "state", ast_json_string_create(row->state));
     ast_json_object_set(j, "created_at", ast_json_integer_create(row->created_at));
+    if (is_mt) {
+        ast_json_object_set(j, "attempts", ast_json_integer_create(row->attempts));
+        ast_json_object_set(j, "last_result", ast_json_string_create(row->last_result));
+        ast_json_object_set(j, "next_retry_at", ast_json_integer_create(row->next_retry_at));
+        ast_json_object_set(j, "sent_at", ast_json_integer_create(row->sent_at));
+        ast_json_object_set(j, "delivered_at", ast_json_integer_create(row->delivered_at));
+    } else {
+        ast_json_object_set(j, "srr_status", ast_json_integer_create(row->srr_status));
+        ast_json_object_set(j, "mr", ast_json_integer_create(row->mr));
+    }
     ast_json_array_append(((struct mt_sms_json_ctx*)ctx)->arr, j);
     return 0;
 }
@@ -1360,7 +1442,7 @@ static void mt_web_serve_client(int client_fd)
     } else if (!strcmp(path, "/status.json")) {
         mt_web_status_json(client_fd);
     } else if (!strcmp(path, "/")) {
-        mt_web_status_html(client_fd, mt_web_page_param(query));
+        mt_web_status_html(client_fd);
     } else if (!strcmp(path, "/sms")) {
         mt_web_sms_index_html(client_fd);
     } else if (ast_begins_with(path, "/sms/")) {

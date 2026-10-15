@@ -24,6 +24,9 @@
     _(AT_CCWA_STATUS, "AT+CCWA?")                   \
     _(AT_CCWA_SET, "AT+CCWA=")                      \
     _(AT_CFUN, "AT+CFUN")                           \
+    _(AT_CFUN0, "AT+CFUN=0")                     \
+    _(AT_CFUN1, "AT+CFUN=1")                     \
+    _(AT_CFUN_PAUSE, "CFUN-pause")               \
                                                     \
     _(AT_CGMI, "AT+CGMI")                           \
     _(AT_CGMM, "AT+CGMM")                           \
@@ -147,6 +150,8 @@ int at_enqueue_ussd(struct cpvt* cpvt, const char* code, int gsm7);
 int at_enqueue_dtmf(struct cpvt* cpvt, char digit);
 int at_enqueue_set_ccwa(struct cpvt* cpvt, unsigned call_waiting);
 int at_enqueue_reset(struct cpvt* cpvt);
+int at_enqueue_soft_reset(struct cpvt* cpvt);
+int at_enqueue_cfun1(struct cpvt* cpvt);
 int at_enqueue_dial(struct cpvt* cpvt, const char* number, int clir);
 int at_enqueue_answer(struct cpvt* cpvt);
 int at_enqueue_user_cmd(struct cpvt* cpvt, const char* input);

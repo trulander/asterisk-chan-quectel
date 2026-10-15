@@ -81,13 +81,18 @@ static void cmd_timeout(struct pvt* const pvt)
         return;
     }
 
+    /* Copy the flags before at_response(): handling the timeout may remove and
+       free the head task (e.g. a queue-native pause), which would invalidate
+       ecmd before the IGNORE check below. */
+    const unsigned eflags = ecmd->flags;
+
     if (at_response(pvt, &pvt->empty_str, RES_TIMEOUT)) {
         ast_log(LOG_ERROR, "[%s] Fail to handle response\n", PVT_ID(pvt));
         pvt->terminate_monitor = 1;
         return;
     }
 
-    if (ecmd->flags & ATQ_CMD_FLAG_IGNORE) {
+    if (eflags & ATQ_CMD_FLAG_IGNORE) {
         return;
     }
 

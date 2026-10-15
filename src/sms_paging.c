@@ -14,12 +14,17 @@
 
 #include "sms_paging.h"
 
-/*! Per-device page (MT + MO merged, newest first). */
+/*! Per-device page (MT + MO merged, newest first). The extra columns are the
+    MT-only mt_queue fields and MO-only mt_out fields; the opposite direction
+    carries -1/empty sentinels so the renderer can show them as an em-dash. */
 static const char SMS_PAGE_DEV_SQL[] =
-    "SELECT 'mt' AS direction, device, mid AS ref_id, from_num AS peer, msg, ts, state, created_at AS ts_epoch, CAST(rowid AS INTEGER) AS seq "
+    "SELECT 'mt' AS direction, device, mid AS ref_id, from_num AS peer, msg, ts, state, created_at AS ts_epoch, CAST(rowid AS INTEGER) AS seq,"
+    " attempts, next_retry_at, last_result, sent_at, delivered_at, -1 AS srr_status, -1 AS mr "
     "FROM mt_queue WHERE device = ? "
     "UNION ALL "
-    "SELECT 'mo', device, CAST(id AS TEXT) AS ref_id, dst, msg, ts, state, created_at AS ts_epoch, id AS seq "
+    "SELECT 'mo', device, CAST(id AS TEXT) AS ref_id, dst, msg, ts, state, created_at AS ts_epoch, id AS seq,"
+    " -1 AS attempts, -1 AS next_retry_at, NULL AS last_result, -1 AS sent_at, -1 AS delivered_at,"
+    " COALESCE(srr_status, -1) AS srr_status, COALESCE(mr, -1) AS mr "
     "FROM mt_out WHERE device = ? "
     "ORDER BY ts_epoch DESC, seq DESC LIMIT ? OFFSET ?";
 
@@ -29,10 +34,13 @@ static const char SMS_COUNT_DEV_SQL[] =
 
 /*! All-devices page (MT + MO merged, newest first). */
 static const char SMS_PAGE_ALL_SQL[] =
-    "SELECT 'mt' AS direction, device, mid AS ref_id, from_num AS peer, msg, ts, state, created_at AS ts_epoch, CAST(rowid AS INTEGER) AS seq "
+    "SELECT 'mt' AS direction, device, mid AS ref_id, from_num AS peer, msg, ts, state, created_at AS ts_epoch, CAST(rowid AS INTEGER) AS seq,"
+    " attempts, next_retry_at, last_result, sent_at, delivered_at, -1 AS srr_status, -1 AS mr "
     "FROM mt_queue "
     "UNION ALL "
-    "SELECT 'mo', device, CAST(id AS TEXT) AS ref_id, dst, msg, ts, state, created_at AS ts_epoch, id AS seq "
+    "SELECT 'mo', device, CAST(id AS TEXT) AS ref_id, dst, msg, ts, state, created_at AS ts_epoch, id AS seq,"
+    " -1 AS attempts, -1 AS next_retry_at, NULL AS last_result, -1 AS sent_at, -1 AS delivered_at,"
+    " COALESCE(srr_status, -1) AS srr_status, COALESCE(mr, -1) AS mr "
     "FROM mt_out "
     "ORDER BY ts_epoch DESC, seq DESC LIMIT ? OFFSET ?";
 
@@ -64,6 +72,13 @@ static void sms_row_fill(struct sms_paging_row* row, sqlite3_stmt* stmt)
     row_copy_text(row->state, sizeof(row->state), stmt, 6, "");
     row->created_at = (long)sqlite3_column_int64(stmt, 7);
     row->id         = (long)sqlite3_column_int64(stmt, 8);
+    row->attempts = (long)sqlite3_column_int64(stmt, 9);
+    row->next_retry_at = (long)sqlite3_column_int64(stmt, 10);
+    row_copy_text(row->last_result, sizeof(row->last_result), stmt, 11, "");
+    row->sent_at = (long)sqlite3_column_int64(stmt, 12);
+    row->delivered_at = (long)sqlite3_column_int64(stmt, 13);
+    row->srr_status = (long)sqlite3_column_int64(stmt, 14);
+    row->mr = (long)sqlite3_column_int64(stmt, 15);
 }
 
 int sms_paging_count(sqlite3* db, const char* device, int* total)
