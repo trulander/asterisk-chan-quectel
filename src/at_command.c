@@ -790,7 +790,9 @@ int at_enqueue_soft_reset(struct cpvt* cpvt)
 
     /* CFUN-pause is never sent to the modem: it has no payload and expects
        RES_TIMEOUT, so it just delays the queue by its timeout (see
-       at_queue_run/cmd_timeout). No blocking sleep in the monitor thread. */
+       at_queue_run/cmd_timeout). The deadline is armed exactly once when the
+       pause becomes the head command; modem chatter cannot prolong it. No
+       blocking sleep in the monitor thread. */
     static const at_queue_cmd_t cmds[] = {
         ATQ_CMD_DECLARE_ST(CMD_AT_CFUN0, cfun0),
         ATQ_CMD_DECLARE_DYNFT(CMD_AT_CFUN_PAUSE, RES_TIMEOUT, ATQ_CMD_FLAG_IGNORE, PVT_CFUN_SOFT_RESET_PAUSE_SEC, 0),

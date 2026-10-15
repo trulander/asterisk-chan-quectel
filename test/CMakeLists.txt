@@ -21,3 +21,13 @@ target_include_directories(ctq_sms_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(ctq_sms_paging_test PRIVATE SQLite::SQLite3)
 target_compile_options(ctq_sms_paging_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-paging COMMAND ctq_sms_paging_test)
+
+# at_pause: queue-native pause deadline arming (arm exactly once; later
+# URC/response re-entries must not re-base the absolute deadline). The logic
+# is a header-only pure inline (src/at_pause.h), so no production .c is needed.
+add_executable(ctq_at_pause_test
+    at_pause_test.c
+)
+target_include_directories(ctq_at_pause_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_options(ctq_at_pause_test PRIVATE -Wall -Wextra)
+add_test(NAME at-pause COMMAND ctq_at_pause_test)

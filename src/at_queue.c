@@ -15,6 +15,8 @@
 
 #include "at_queue.h"
 
+#include "at_pause.h" /* at_pause_arm_once() */
+
 #include "chan_quectel.h" /* struct pvt */
 #include "helpers.h"
 
@@ -216,7 +218,16 @@ int at_queue_run(struct pvt* pvt)
                but its expected result is a real response, so it stays a
                no-op here. */
             if (cmd->res == RES_TIMEOUT) {
-                cmd->timeout = ast_tvadd(ast_tvnow(), cmd->timeout);
+                /* The pause deadline is armed exactly once, the first time the
+                   pause becomes the head command. at_queue_run() is re-entered
+                   on every URC/response; re-arming here on every pass would
+                   let modem chatter keep postponing the absolute deadline, so
+                   the pause (and thus the soft reset) could stall
+                   indefinitely. */
+                const struct timeval now = ast_tvnow();
+                if (at_pause_arm_once(&cmd->timeout, &cmd->flags, ATQ_CMD_FLAG_TIMEOUT_ARMED, &now)) {
+                    ast_debug(4, "[%s][%s] pause deadline armed\n", PVT_ID(pvt), at_cmd2str(cmd->cmd));
+                }
             }
             return fail;
         }

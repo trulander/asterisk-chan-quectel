@@ -192,6 +192,7 @@ void dc_sconfig_fill_defaults(struct dc_sconfig* config)
     ast_copy_string(config->language, DEFAULT_LANGUAGE, sizeof(config->language));
 
     config->reset_modem   = 1;
+    config->cfun_soft_reset = 0; /* opt-in, off by default: never touch the modem on failed init unless explicitly enabled */
     config->calling_pres  = -1;
     config->init_state    = DEV_STATE_STARTED;
     config->call_waiting  = CALL_WAITING_AUTO;
@@ -243,6 +244,8 @@ void dc_sconfig_fill(struct ast_config* cfg, const char* cat, struct dc_sconfig*
             config->sms_autodelete = parse_on_off(v->name, v->value, 0u); /* autodeletesms is set to 0 if invalid */
         } else if (!strcasecmp(v->name, "resetmodem")) {
             config->reset_modem = parse_on_off(v->name, v->value, 0u); /* resetmodem is set to 0 if invalid */
+        } else if (!strcasecmp(v->name, "cfunreset")) {
+            config->cfun_soft_reset = parse_on_off(v->name, v->value, 0u); /* cfunreset is set to 0 if invalid; opt-in, off by default */
         } else if (!strcasecmp(v->name, "disable")) {
             const unsigned int is = parse_on_off(v->name, v->value, 0u);
             config->init_state    = is ? DEV_STATE_REMOVED : DEV_STATE_STARTED;
@@ -420,7 +423,7 @@ static int dc_sconfig_compare(const struct dc_sconfig* const cfg1, const struct 
     return strcmp(cfg1->context, cfg2->context) || strcmp(cfg1->exten, cfg2->exten) || strcmp(cfg1->language, cfg2->language) || cfg1->group != cfg2->group ||
            cfg1->rxgain != cfg2->rxgain || cfg1->txgain != cfg2->txgain || cfg1->calling_pres != cfg2->calling_pres ||
            cfg1->use_calling_pres != cfg2->use_calling_pres || cfg1->sms_autodelete != cfg2->sms_autodelete || cfg1->reset_modem != cfg2->reset_modem ||
-           cfg1->multiparty != cfg2->multiparty || cfg1->dtmf != cfg2->dtmf || cfg1->moh != cfg2->moh || cfg1->query_time != cfg2->query_time ||
+           cfg1->cfun_soft_reset != cfg2->cfun_soft_reset || cfg1->multiparty != cfg2->multiparty || cfg1->dtmf != cfg2->dtmf || cfg1->moh != cfg2->moh || cfg1->query_time != cfg2->query_time ||
            cfg1->dsci != cfg2->dsci || cfg1->qhup != cfg2->qhup || cfg1->dtmf_duration != cfg2->dtmf_duration || cfg1->init_state != cfg2->init_state ||
            cfg1->call_waiting != cfg2->call_waiting || cfg1->msg_service != cfg2->msg_service || cfg1->msg_direct != cfg2->msg_direct ||
            cfg1->msg_storage != cfg2->msg_storage;

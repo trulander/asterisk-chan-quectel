@@ -145,6 +145,7 @@ static char* cli_show_device_settings(struct ast_cli_entry* e, int cmd, struct a
         ast_cli(a->fd, "  Direct Message          : %s\n", dc_3stbool2str_capitalized(CONF_SHARED(pvt, msg_direct)));
         ast_cli(a->fd, "  Auto Delete SMS         : %s\n", AST_CLI_YESNO(CONF_SHARED(pvt, sms_autodelete)));
         ast_cli(a->fd, "  Reset Modem             : %s\n", AST_CLI_YESNO(CONF_SHARED(pvt, reset_modem)));
+        ast_cli(a->fd, "  CFUN Soft Reset         : %s\n", AST_CLI_YESNO(CONF_SHARED(pvt, cfun_soft_reset)));
         ast_cli(a->fd, "  Call Waiting            : %s\n", dc_cw_setting2str(CONF_SHARED(pvt, call_waiting)));
         ast_cli(a->fd, "  Multiparty Calls        : %s\n", AST_CLI_YESNO(CONF_SHARED(pvt, multiparty)));
         ast_cli(a->fd, "  DTMF Detection          : %s\n", AST_CLI_YESNO(CONF_SHARED(pvt, dtmf)));

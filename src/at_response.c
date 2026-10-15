@@ -599,6 +599,11 @@ static void __attribute__((format(printf, 7, 8))) at_err_response_log(int level,
  * \brief Decide whether a failed init command should trigger a soft modem
  * reset (AT+CFUN=0 -> AT+CFUN=1) and arm it when it should.
  *
+ * Opt-in feature: controlled by the 'cfunreset' config option, which defaults
+ * to off. Without an explicit opt-in this never sets cfun_soft_reset_pending
+ * and never sends CFUN, so init failures fall back to the plain reconnect
+ * loop exactly as before the feature existed.
+ *
  * Only used for commands that exist solely in the init sequence (CMD_AT_Z /
  * CMD_AT_CPIN) and only while the device is not yet initialized: ordinary
  * runtime errors never reach soft reset. The AT+CFUN=0/pause/AT+CFUN=1
@@ -609,7 +614,8 @@ static void __attribute__((format(printf, 7, 8))) at_err_response_log(int level,
  */
 static int at_try_soft_reset(struct pvt* const pvt, const at_queue_cmd_t* const ecmd, const at_res_t at_res)
 {
-    if (at_res == RES_TIMEOUT || pvt->initialized || pvt->cfun_soft_reset_pending || pvt->cfun_soft_reset_count >= PVT_CFUN_SOFT_RESET_LIMIT) {
+    if (!CONF_SHARED(pvt, cfun_soft_reset) || at_res == RES_TIMEOUT || pvt->initialized || pvt->cfun_soft_reset_pending ||
+        pvt->cfun_soft_reset_count >= PVT_CFUN_SOFT_RESET_LIMIT) {
         return 0;
     }
 
