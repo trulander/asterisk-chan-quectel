@@ -60,7 +60,6 @@ typedef struct dc_sconfig {
     unsigned int use_calling_pres:1; /*! -1 */
     unsigned int sms_autodelete  :1; /*! 0 */
     unsigned int reset_modem     :1; /*! 1 */
-    unsigned int cfun_soft_reset :1; /*! 0 (opt-in) recover a stuck SIM on failed init with AT+CFUN=0/1 */
     unsigned int multiparty      :1; /*! 0 */
     unsigned int dtmf            :1; /*! 0 */
     unsigned int moh             :1; /*! 0 */

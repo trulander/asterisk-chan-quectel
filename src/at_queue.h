@@ -34,7 +34,6 @@ typedef struct at_queue_cmd {
 #define ATQ_CMD_FLAG_STATIC 0x01         /*!< data is static no try deallocate */
 #define ATQ_CMD_FLAG_IGNORE 0x02         /*!< ignore response non match condition */
 #define ATQ_CMD_FLAG_SUPPRESS_ERROR 0x04 /*!< don't print error message if command fails */
-#define ATQ_CMD_FLAG_TIMEOUT_ARMED 0x08  /*!< absolute command timeout deadline has already been armed (queue-native pause) */
 
     struct timeval timeout;      /*!< timeout value, started at time when command actually written on device */
 #define ATQ_CMD_TIMEOUT_SHORT 1  /*!< timeout value  1 sec */
