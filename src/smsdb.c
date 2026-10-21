@@ -30,6 +30,13 @@
 
 #include "smsdb.h"
 
+#include "sms_tx.h"
+
+/* Map the dependency-free transaction logging hook to ast_log so every
+ * BEGIN/COMMIT/ROLLBACK failure surfaces in messages with the thread-id and the
+ * calling function name (see the SMS_TX_SCOPE macro in sms_tx.h). */
+#define SMS_TX_LOG(fmt, ...) ast_log(LOG_ERROR, fmt, __VA_ARGS__)
+
 #include "chan_quectel.h"
 
 static const size_t DBKEY_DEF_LEN = 32;
@@ -215,27 +222,13 @@ static int clean_stmt(sqlite3_stmt** stmt, const char* sql)
 
 #define CLEAN_STMT(s) clean_stmt(&s##_stmt, s##_sql)
 
-static int begin_transaction()
-{
-    DEFINE_INTERNAL_SQL_STATEMENT(begin_transaction, "BEGIN TRANSACTION");
+/* Transaction primitives and the RAII SMS_TX_SCOPE macro live in src/sms_tx.h:
+ * they hold the recursive per-connection mutex across the whole BEGIN..COMMIT
+ * window (fixing the nested-BEGIN race) and roll back on a failed COMMIT instead
+ * of silently leaking an open transaction. SCOPED_DB below is kept as a thin
+ * wrapper over the same mutex for the many single-statement operations. */
 
-    return EXECUTE_STMT(begin_transaction);
-}
-
-static void commit_transaction(int res)
-{
-    DEFINE_INTERNAL_SQL_STATEMENT(commit_transaction, "COMMIT TRANSACTION");
-
-    if (res != SQLITE_OK) {
-        return;
-    }
-
-    EXECUTE_STMT(commit_transaction);
-}
-
-#define SCOPED_TRANSACTION(varname)                                  \
-    RAII_VAR(int, varname, begin_transaction(), commit_transaction); \
-    if (varname != SQLITE_OK) return -1;
+#define SCOPED_DB(d) RAII_VAR(sqlite3_mutex*, d##_mtx, sms_tx_lock(d), sms_tx_unlock)
 
 static sqlite3_stmt* stmt_begin(int level, const char* file, int line, const char* function, sqlite3_stmt* const stmt)
 {
@@ -268,29 +261,6 @@ static void stmt_end(int level, const char* file, int line, const char* function
     auto void _stmt_dtor_##s(sqlite3_stmt* const*);                          \
     void _stmt_dtor_##s(sqlite3_stmt* const* s) { stmt_end(LOG_ERROR, *s); } \
     sqlite3_stmt* const s __attribute__((cleanup(_stmt_dtor_##s))) = stmt_begin(LOG_WARNING, s##_stmt)
-
-static sqlite3_mutex* db_lock(sqlite3* db)
-{
-    //
-    // sqlite3_db_mutex function have been introduced in version 3.6.5 (2008-11-12) of SQLite
-    //
-    sqlite3_mutex* const mtx = sqlite3_db_mutex(db);
-    if (!mtx) {
-        return NULL;
-    }
-    sqlite3_mutex_enter(mtx);
-    return mtx;
-}
-
-static void db_unlock(sqlite3_mutex* const mtx)
-{
-    if (!mtx) {
-        return;
-    }
-    sqlite3_mutex_leave(mtx);
-}
-
-#define SCOPED_DB(d) RAII_VAR(sqlite3_mutex*, d##_mtx, db_lock(d), db_unlock)
 
 static int db_create(void)
 {
@@ -329,7 +299,7 @@ static int db_create(void)
     DEFINE_INTERNAL_SQL_STATEMENT(alter_mt_out_imdn_id, "ALTER TABLE mt_out ADD COLUMN imdn_id TEXT")
 
     SCOPED_DB(smsdb);
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, "schema");
 
     EXECUTE_VSTMT(create_incomingmsg);
     EXECUTE_VSTMT(create_incomingmsg_index);
@@ -622,7 +592,7 @@ int smsdb_put(const char* id, const char* addr, int ref, int parts, int order, c
     }
 
     int res;
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, addr);
 
     if ((res = put_incmsg(fullkey, order, msg))) {
         return res;
@@ -694,7 +664,7 @@ int smsdb_get_refid(const char* id, const char* addr)
 
     int res, use_insert = 0;
 
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, addr);
 
     if ((res = get_refid(fullkey)) == -2) {
         res        = 0;
@@ -714,7 +684,7 @@ int smsdb_outgoing_add(const char* id, const char* addr, const char* msg, int cn
     int res;
 
     SCOPED_DB(smsdb);
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, id);
     SCOPED_STMT(put_outgoingmsg);
 
     if ((res = sqlite3_bind_text(put_outgoingmsg, 1, id, strlen(id), SQLITE_TRANSIENT)) != SQLITE_OK) {
@@ -829,7 +799,7 @@ static int smsdb_outgoing_clear_nolock(int uid)
 
 int smsdb_outgoing_clear(int uid, struct ast_str** dst, struct ast_str** msg)
 {
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, "clear");
 
     if (get_outmsg(uid, dst, msg)) {
         return -1;
@@ -926,7 +896,7 @@ int smsdb_outgoing_part_put(int uid, int refid, struct ast_str** dst, struct ast
 
     RAII_VAR(struct ast_str*, fullkey, ast_str_create(DBKEY_DEF_LEN), ast_free);
 
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, "part_put");
 
     if (get_outmsg_key(uid, refid, &fullkey, &srr)) {
         return -1;
@@ -1055,7 +1025,7 @@ int smsdb_outgoing_part_status(const char* id, const char* addr, int mr, int st,
         return -1;
     }
 
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, addr);
 
     if (get_outpart(fullkey, &partid, &uid)) {
         return -1;
@@ -1099,7 +1069,7 @@ static int get_outmsg_expired(int* uid, struct ast_str** dst, struct ast_str** m
 
 int smsdb_outgoing_purge_one(int* uid, struct ast_str** dst, struct ast_str** msg)
 {
-    SCOPED_TRANSACTION(dbtrans);
+    SMS_TX_SCOPE(dbtrans, smsdb, "purge");
 
     if (get_outmsg_expired(uid, dst, msg)) {
         return -1;
@@ -1156,8 +1126,8 @@ static void mt_out_row_fill(struct smsdb_mt_out_row* row, sqlite3_stmt* stmt)
     ast_copy_string(row->ts, S_OR(ts, ""), sizeof(row->ts));
     ast_copy_string(row->state, S_OR(state, ""), sizeof(row->state));
     ast_copy_string(row->imdn_id, S_OR(imdn_id, ""), sizeof(row->imdn_id));
-    row->srr_status = sqlite3_column_int(stmt, 6);
-    row->mr         = sqlite3_column_int(stmt, 7);
+    row->srr_status = sms_tx_column_int_or_null(stmt, 6, -1);
+    row->mr         = sms_tx_column_int_or_null(stmt, 7, -1);
     row->created_at = (long)sqlite3_column_int64(stmt, 9);
     row->updated_at = (long)sqlite3_column_int64(stmt, 10);
 }

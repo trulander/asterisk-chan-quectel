@@ -21,3 +21,17 @@ target_include_directories(ctq_sms_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(ctq_sms_paging_test PRIVATE SQLite::SQLite3)
 target_compile_options(ctq_sms_paging_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-paging COMMAND ctq_sms_paging_test)
+
+# sms_tx: dependency-free SQLite transaction primitives (src/sms_tx.[ch]).
+# Exercises the nested-BEGIN fix directly against an in-memory database:
+# concurrent begin/commit on one connection, failed COMMIT -> ROLLBACK (no
+# half-open connection), failed BEGIN, COMMIT contention/SQLITE_BUSY -> no
+# leak, multipart out-of-order/duplicate seqorder, and SRR-NULL rendering.
+add_executable(ctq_sms_tx_test
+    sms_tx_test.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_tx.c
+)
+target_include_directories(ctq_sms_tx_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_sms_tx_test PRIVATE SQLite::SQLite3 Threads::Threads)
+target_compile_options(ctq_sms_tx_test PRIVATE -Wall -Wextra)
+add_test(NAME sms-tx COMMAND ctq_sms_tx_test)

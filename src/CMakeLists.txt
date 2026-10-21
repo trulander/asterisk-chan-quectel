@@ -28,6 +28,7 @@ set(SRC_FILES
     ringbuffer.c
     smsdb.c
     sms_paging.c
+    sms_tx.c
     tty.c
     web_util.c
 )
