@@ -312,6 +312,28 @@ int at_queue_insert_uid(struct cpvt* cpvt, at_queue_cmd_t* cmds, unsigned cmdsno
 
 int at_queue_insert(struct cpvt* cpvt, at_queue_cmd_t* cmds, unsigned cmdsno, int athead) { return at_queue_insert_uid(cpvt, cmds, cmdsno, athead, 0); }
 
+int at_queue_insert_sms_delete(struct cpvt* cpvt, at_queue_cmd_t* cmd, long long rowid, int athead)
+{
+    at_queue_task_t* const task = at_queue_add(cpvt, cmd, 1u, athead, 0u);
+    if (!task) {
+        at_queue_free_data(cmd);
+        return -1;
+    }
+    task->sms_delete_rowid = rowid;
+    return at_queue_run(cpvt->pvt);
+}
+
+int at_queue_insert_sms_verify(struct cpvt* cpvt, at_queue_cmd_t* cmds, unsigned cmdsno, long long rowid, int athead)
+{
+    at_queue_task_t* const task = at_queue_add(cpvt, cmds, cmdsno, athead, 0u);
+    if (!task) {
+        for (unsigned i = 0; i < cmdsno; ++i) at_queue_free_data(&cmds[i]);
+        return -1;
+    }
+    task->sms_verify_rowid = rowid;
+    return at_queue_run(cpvt->pvt);
+}
+
 void at_queue_handle_result(struct pvt* pvt, at_res_t res) { at_queue_remove_cmd(pvt, res); }
 
 void at_queue_flush(struct pvt* pvt)

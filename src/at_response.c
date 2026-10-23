@@ -11,6 +11,7 @@
    Copyright (C) 2020 Max von Buelow <max@m9x.de>
 */
 #include <sys/sysinfo.h>
+#include <time.h>
 
 #include "ast_config.h"
 
@@ -33,6 +34,8 @@
 #include "mt_task.h"
 #include "mutils.h" /* STRLEN() */
 #include "smsdb.h"
+#include "sms_delete_state.h"
+#include "sms_delete_flow.h"
 
 // ================================================================
 
@@ -180,6 +183,125 @@ static void __attribute__((format(printf, 7, 8))) at_ok_response_log(int level, 
 #define at_ok_response_err(pvt, ecmd, ...) at_ok_response_log(LOG_ERROR, pvt, ecmd, __VA_ARGS__)
 #define at_ok_response_wrn(pvt, ecmd, ...) at_ok_response_log(LOG_WARNING, pvt, ecmd, __VA_ARGS__)
 #define at_ok_response_notice(pvt, ecmd, ...) at_ok_response_log(LOG_NOTICE, pvt, ecmd, __VA_ARGS__)
+
+static int at_sms_start_verify(struct pvt* pvt, long long rowid, int index)
+{
+    return at_enqueue_sms_delete_verify(&pvt->sys_chan, rowid, index);
+}
+
+static void at_sms_defer_db_retry(struct pvt* pvt, int index)
+{
+    if (!CONF_SHARED(pvt, sms_autodelete) || index < 0) {
+        return;
+    }
+    pvt->sms_db_retry_index = index;
+    pvt->sms_db_retry_at = (int)time(NULL) + CONF_GLOBAL(mt_retry_interval);
+}
+
+static int at_sms_queue_delete(struct pvt* pvt, int index, long long rowid)
+{
+    if (smsdb_incoming_delete_apply(rowid, SMS_DELETE_EVENT_DELETE_QUEUED, 0, NULL, NULL)) {
+        return -1;
+    }
+    if (at_enqueue_delete_sms_row(&pvt->sys_chan, index, rowid)) {
+        smsdb_incoming_delete_apply(rowid, SMS_DELETE_EVENT_QUEUE_FAILED,
+                                    (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
+        return -1;
+    }
+    return 0;
+}
+
+/* Bridge parsed AT contents to the dependency-light orchestration seam. Save and
+ * queue callbacks perform synchronous SQLite commits; delete_cell runs only
+ * after those durable steps, while verification callbacks keep rowid identity. */
+typedef struct sms_flow_context {
+    struct pvt* pvt;
+    const char* sender;
+    const char* message;
+    const char* timestamp;
+    struct ast_str** fullmsg;
+    int index;
+    int ref;
+    int parts;
+    int order;
+    int verifying;
+    int mt_queue_saved;
+    int mt_queue_inserted;
+    char mid[MT_MID_LEN];
+} sms_flow_context_t;
+
+/* Commits the current segment and assembly before the flow can queue or delete it. */
+static int sms_flow_save_cell(void* opaque, sms_flow_result_t* result)
+{
+    sms_flow_context_t* context = opaque;
+    const int count = smsdb_put_sim(PVT_ID(context->pvt), context->sender, context->ref, context->parts, context->order,
+                                    context->message, "SM", context->index, context->fullmsg, &result->durable_rowid);
+    if (count <= 0) return -1;
+    ast_str_update(*context->fullmsg);
+    result->complete = count == context->parts;
+    if (context->pvt->sms_db_retry_index == context->index) {
+        context->pvt->sms_db_retry_index = -1;
+        context->pvt->sms_db_retry_at = 0;
+    }
+    return 0;
+}
+
+/* Only called for a complete assembly; MT insertion and group marker must be durable before CMGD. */
+static int sms_flow_queue_complete(void* opaque, const sms_flow_result_t* result)
+{
+    sms_flow_context_t* context = opaque;
+    (void)result;
+    int already_queued = smsdb_incoming_group_mt_mid(PVT_ID(context->pvt), context->sender, context->ref, context->parts,
+                                                      "SM", context->index, context->mid, sizeof(context->mid));
+    if (already_queued < 0) return -1;
+    if (already_queued) {
+        /* Reuse the durable marker (including legacy markers without a stored MID); do not generate a new queue identity. */
+        context->mt_queue_saved = 1;
+        return 0;
+    }
+    mt_gen_mid(PVT_ID(context->pvt), context->mid, sizeof(context->mid));
+    int inserted = 0;
+    char effective_mid[MT_MID_LEN];
+    if (smsdb_mt_queue_incoming_group(PVT_ID(context->pvt), context->sender, context->ref, context->parts, "SM", context->index,
+                                      context->mid, context->sender, ast_str_buffer(*context->fullmsg), context->timestamp,
+                                      effective_mid, sizeof(effective_mid), &inserted)) return -1;
+    ast_copy_string(context->mid, effective_mid, sizeof(context->mid));
+    context->mt_queue_saved = 1;
+    context->mt_queue_inserted = inserted;
+    if (inserted) mt_kick();
+    return 0;
+}
+
+/* Persist the next state first; a stopped row is deliberately not given another CMGD. */
+static int sms_flow_delete_cell(void* opaque, const sms_flow_result_t* result)
+{
+    sms_flow_context_t* context = opaque;
+    if (context->verifying) {
+        int status = SMS_DELETE_PENDING;
+        if (smsdb_incoming_delete_apply(context->pvt->sms_verify_rowid, SMS_DELETE_EVENT_VERIFY_PRESENT_SAVED, 0, &status, NULL)) return -1;
+        return status == SMS_DELETE_PENDING ? at_sms_queue_delete(context->pvt, context->index, context->pvt->sms_verify_rowid) : 0;
+    }
+    return at_sms_queue_delete(context->pvt, context->index, result->durable_rowid);
+}
+
+/* A successful fresh SM listing with no target entry is durable deletion proof. */
+static int sms_flow_mark_absent(void* opaque)
+{
+    sms_flow_context_t* context = opaque;
+    return smsdb_incoming_delete_apply(context->pvt->sms_verify_rowid, SMS_DELETE_EVENT_VERIFY_ABSENT, 0, NULL, NULL);
+}
+
+/* DB/read failures defer without incrementing confirmed CMGD failures. */
+static void sms_flow_defer_retry(void* opaque)
+{
+    sms_flow_context_t* context = opaque;
+    if (context->verifying) {
+        smsdb_incoming_delete_apply(context->pvt->sms_verify_rowid, SMS_DELETE_EVENT_DB_ERROR,
+                                    (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
+    } else {
+        at_sms_defer_db_retry(context->pvt, context->index);
+    }
+}
 
 static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at_queue_task_t* const task, const at_queue_cmd_t* const ecmd)
 {
@@ -428,6 +550,11 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
 
         case CMD_AT_CMGD:
             at_ok_response_dbg(3, pvt, ecmd, "Message deleted successfully");
+            /* If this state COMMIT fails, CMGD_SENT remains due; the picker
+             * includes it and restart recovery confirms the cell with fresh CMGL. */
+            if (task->sms_delete_rowid > 0 && smsdb_incoming_delete_apply(task->sms_delete_rowid, SMS_DELETE_EVENT_CMGD_OK, 0, NULL, NULL)) {
+                ast_log(LOG_ERROR, "[%s][SMS:%d] Could not persist confirmed SIM deletion\n", PVT_ID(pvt), task->uid);
+            }
             break;
 
         case CMD_AT_CSQ:
@@ -483,6 +610,19 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
 
         case CMD_AT_CMGL:
             at_ok_response_dbg(1, pvt, ecmd, "Messages listed");
+            if (pvt->sms_verify_active && task->sms_verify_rowid == pvt->sms_verify_rowid) {
+                if (!pvt->sms_verify_found) {
+                    sms_flow_context_t context = {.pvt = pvt, .index = pvt->sms_verify_index, .verifying = 1};
+                    const sms_flow_request_t request = {1, SMS_FLOW_SIM_CELL, PVT_ID(pvt), "SM", pvt->sms_verify_index, 0};
+                    const sms_flow_ops_t ops = {NULL, NULL, NULL, sms_flow_mark_absent, sms_flow_defer_retry};
+                    sms_flow_result_t result;
+                    sms_delete_flow_process(&request, SMS_FLOW_CELL_ABSENT, &ops, &context, &result);
+                }
+                pvt->sms_verify_active = 0;
+                pvt->sms_verify_rowid = 0;
+                pvt->sms_verify_index = -1;
+                pvt->sms_verify_found = 0;
+            }
             break;
 
         case CMD_AT_CNMA:
@@ -715,6 +855,19 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
         case CMD_AT_CNMI:
             at_err_response_dbg(1, pvt, ecmd, "No SMS support");
             pvt->has_sms = 0;
+            if (ecmd->cmd == CMD_AT_CPMS && pvt->incoming_sms_index >= 0) {
+                at_sms_defer_db_retry(pvt, pvt->incoming_sms_index);
+                at_sms_retrieved(&pvt->sys_chan, 0);
+            }
+            if (ecmd->cmd == CMD_AT_CPMS && task->sms_verify_rowid > 0 && pvt->sms_verify_active &&
+                task->sms_verify_rowid == pvt->sms_verify_rowid) {
+                smsdb_incoming_delete_apply(task->sms_verify_rowid, SMS_DELETE_EVENT_VERIFY_READ_ERROR,
+                                            (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
+                pvt->sms_verify_active = 0;
+                pvt->sms_verify_rowid = 0;
+                pvt->sms_verify_index = -1;
+                pvt->sms_verify_found = 0;
+            }
             break;
 
         case CMD_AT_CSCS:
@@ -785,11 +938,22 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
         case CMD_AT_CMGR:
             // log_cmd_response(LOG_ERROR, pvt, ecmd, "Error reading SMS message, resetting index");
             at_err_response_dbg(1, pvt, ecmd, "[SMS:%d] Fail to read message", pvt->incoming_sms_index);
+            at_sms_defer_db_retry(pvt, pvt->incoming_sms_index);
             at_sms_retrieved(&pvt->sys_chan, 0);
             break;
 
         case CMD_AT_CMGD:
             at_err_response_err(pvt, ecmd, "Error deleting message");
+            if (task->sms_delete_rowid > 0) {
+                /* Persist the failed/uncertain CMGD before queueing a fresh read;
+                 * the next durable present result is the only event that counts it. */
+                smsdb_incoming_delete_apply(task->sms_delete_rowid, at_res == RES_TIMEOUT ? SMS_DELETE_EVENT_CMGD_TIMEOUT : SMS_DELETE_EVENT_CMGD_ERROR,
+                                            (int)time(NULL), NULL, NULL);
+                if (at_sms_start_verify(pvt, task->sms_delete_rowid, task->uid)) {
+                    smsdb_incoming_delete_apply(task->sms_delete_rowid, SMS_DELETE_EVENT_VERIFY_READ_ERROR,
+                                                (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
+                }
+            }
             break;
 
         case CMD_AT_CMGS:
@@ -886,6 +1050,14 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
 
         case CMD_AT_CMGL:
             at_err_response_dbg(1, pvt, ecmd, "Cannot list messages");
+            if (pvt->sms_verify_active && task->sms_verify_rowid == pvt->sms_verify_rowid) {
+                smsdb_incoming_delete_apply(pvt->sms_verify_rowid, SMS_DELETE_EVENT_VERIFY_READ_ERROR,
+                                            (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
+                pvt->sms_verify_active = 0;
+                pvt->sms_verify_rowid = 0;
+                pvt->sms_verify_index = -1;
+                pvt->sms_verify_found = 0;
+            }
             break;
 
         case CMD_AT_CNMA:
@@ -1534,18 +1706,23 @@ static int at_response_cmgs_error(struct pvt* const pvt, const at_queue_task_t* 
 static int at_response_cmti(struct pvt* const pvt, const struct ast_str* const response)
 {
     int idx;
+    char storage[32];
 
-    if (at_parse_cmti(ast_str_buffer(response), &idx)) {
+    if (at_parse_cmti(ast_str_buffer(response), storage, sizeof(storage), &idx)) {
         ast_log(LOG_WARNING, "[%s] Error parsing incoming message alert '%s', ignoring\n", PVT_ID(pvt), ast_str_buffer(response));
         return -1;
     }
 
+    if (strcmp(storage, "SM")) {
+        ast_debug(1, "[%s][SMS:%d] Ignoring message in unsupported storage %s\n", PVT_ID(pvt), idx, storage);
+        return 0;
+    }
     if (idx < 0) {
         ast_debug(2, "[%s][SMS:%d] Negative message index, ignoring\n", PVT_ID(pvt), idx);
         return 0;
     }
 
-    ast_debug(1, "[%s][SMS:%d] New message\n", PVT_ID(pvt), idx);
+    ast_debug(1, "[%s][SMS:%d] New message in %s\n", PVT_ID(pvt), idx, storage);
 
     if (at_enqueue_retrieve_sms(&pvt->sys_chan, idx, RES_CMTI)) {
         ast_log(LOG_ERROR, "[%s][SMS:%d] Could not read message\n", PVT_ID(pvt), idx);
@@ -1609,6 +1786,9 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
     int res;
     int tpdu_type;
     int idx = pvt->incoming_sms_index;
+    const at_queue_task_t* const response_task = at_queue_head_task(pvt);
+    const int verify_scan = cmd == RES_CMGL && pvt->sms_verify_active && response_task &&
+                            response_task->sms_verify_rowid == pvt->sms_verify_rowid;
     pdu_udh_t udh;
     tristate_bool_t msg_ack = TRIBOOL_NONE;
     int msg_ack_uid         = 0;
@@ -1659,10 +1839,23 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
     if (res < 0) {
         ast_log(LOG_WARNING, "[%s] Error parsing incoming message: %s\n", PVT_ID(pvt), error2str(chan_quectel_err));
         msg_ack = TRIBOOL_FALSE;
+        if (verify_scan) {
+            pvt->sms_verify_found = 1; /* An unparseable listing cannot prove the target cell is absent. */
+            smsdb_incoming_delete_apply(pvt->sms_verify_rowid, SMS_DELETE_EVENT_VERIFY_READ_ERROR,
+                                        (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
+        } else if ((cmd == RES_CMGR || cmd == RES_CMGL) && CONF_SHARED(pvt, sms_autodelete)) {
+            at_sms_defer_db_retry(pvt, idx);
+        }
         goto msg_done;
     }
 
     ast_str_update(msg);
+    if (verify_scan && idx != pvt->sms_verify_index) {
+        return 0;
+    }
+    if (verify_scan && idx == pvt->sms_verify_index) {
+        pvt->sms_verify_found = 1;
+    }
     switch (PDUTYPE_MTI(tpdu_type)) {
         case PDUTYPE_MTI_SMS_STATUS_REPORT: {
             ast_verb(1, "[%s][SMS:%d] Got status report from %s and status code %d\n", PVT_ID(pvt), mr, ast_str_buffer(oa), st);
@@ -1715,35 +1908,61 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
             struct ast_str* scts_str = ast_str_alloca(AST_TM_MAX_LEN);
             format_ast_tm(&scts, scts_str);
 
-            int is_receive_as_is = 0;
-
-            if (udh.parts >= 2) {
-                ast_verb(2, "[%s][SMS:%d PART:%d/%d TS:%s] Got message part from %s: [%s]\n", PVT_ID(pvt), (int)udh.ref, (int)udh.order, (int)udh.parts,
-                         ast_str_buffer(scts_str), ast_str_buffer(oa), ast_str_buffer(msg));
-                int csms_cnt = smsdb_put(pvt->imsi, ast_str_buffer(oa), udh.ref, udh.parts, udh.order, ast_str_buffer(msg), &fullmsg);
-                if (csms_cnt <= 0) {
-                    ast_log(LOG_ERROR, "[%s][SMS:%d PART:%d/%d TS:%s] Error putting message part to database\n", PVT_ID(pvt), (int)udh.ref, (int)udh.order,
-                            (int)udh.parts, ast_str_buffer(scts_str));
-                    is_receive_as_is = 1;
-                } else {
-                    ast_str_update(fullmsg);
-                    msg_ack      = TRIBOOL_TRUE;
-                    msg_ack_uid  = (int)udh.ref;
-                    msg_complete = (csms_cnt < (int)udh.parts) ? 0 : 1;
-
-                    if (!msg_complete) {
-                        if ((int)udh.order == (int)udh.parts) {
-                            ast_debug(1, "[%s][SMS:%d PART:%d/%d TS:%s] Incomplete message, got %d parts\n", PVT_ID(pvt), (int)udh.ref, (int)udh.order,
-                                      (int)udh.parts, ast_str_buffer(scts_str), csms_cnt);
-                        }
-                        goto msg_done;
-                    }
+            const int from_sim = (cmd == RES_CMGR || cmd == RES_CMGL);
+            const int persist_sim_part = from_sim && CONF_SHARED(pvt, sms_autodelete);
+            const int verify_read = verify_scan && idx == pvt->sms_verify_index;
+            int mt_queue_saved = 0;
+            int mt_queue_inserted = 0;
+            char mid[MT_MID_LEN] = {0};
+            if (persist_sim_part) {
+                sms_flow_context_t context = {
+                    .pvt = pvt,
+                    .sender = ast_str_buffer(oa),
+                    .message = ast_str_buffer(msg),
+                    .timestamp = ast_str_buffer(scts_str),
+                    .fullmsg = &fullmsg,
+                    .index = idx,
+                    .ref = (int)udh.ref,
+                    .parts = MAX((int)udh.parts, 1),
+                    .order = MAX((int)udh.order, 1),
+                    .verifying = verify_read,
+                };
+                const sms_flow_request_t request = {1, SMS_FLOW_SIM_CELL, PVT_ID(pvt), "SM", idx, 0};
+                const sms_flow_ops_t ops = {sms_flow_save_cell, sms_flow_queue_complete, sms_flow_delete_cell, sms_flow_mark_absent, sms_flow_defer_retry};
+                sms_flow_result_t result;
+                ast_verb(2, "[%s][SMS:%d PART:%d/%d TS:%s] Got SIM message part from %s: [%s]\n", PVT_ID(pvt), (int)udh.ref, (int)udh.order,
+                         (int)udh.parts, ast_str_buffer(scts_str), ast_str_buffer(oa), ast_str_buffer(msg));
+                if (sms_delete_flow_process(&request, SMS_FLOW_CELL_PRESENT, &ops, &context, &result)) {
+                    ast_log(LOG_ERROR, "[%s][SMS:%d PART:%d/%d TS:%s] Could not persist/queue/delete SIM cell safely\n", PVT_ID(pvt), idx,
+                            (int)udh.order, (int)udh.parts, ast_str_buffer(scts_str));
+                    msg_ack = TRIBOOL_FALSE;
+                    msg_ack_uid = (int)udh.ref;
+                    goto msg_done;
                 }
-            }
-
-            if (udh.parts < 2 || is_receive_as_is) {
-                msg_ack      = TRIBOOL_TRUE;
-                msg_ack_uid  = (int)udh.ref;
+                mt_queue_saved = context.mt_queue_saved;
+                mt_queue_inserted = context.mt_queue_inserted;
+                ast_copy_string(mid, context.mid, sizeof(mid));
+                msg_ack = TRIBOOL_TRUE;
+                msg_ack_uid = (int)udh.ref;
+                msg_complete = result.complete;
+                if (!msg_complete) goto msg_done;
+            } else if (udh.parts >= 2) {
+                const int count = smsdb_put(pvt->imsi, ast_str_buffer(oa), udh.ref, udh.parts, udh.order, ast_str_buffer(msg), &fullmsg);
+                if (count <= 0) {
+                    msg_ack = TRIBOOL_FALSE;
+                    msg_ack_uid = (int)udh.ref;
+                    goto msg_done;
+                }
+                ast_str_update(fullmsg);
+                msg_ack = TRIBOOL_TRUE;
+                msg_ack_uid = (int)udh.ref;
+                msg_complete = count >= (int)udh.parts;
+                if (!msg_complete) goto msg_done;
+                ast_verb(2, "[%s][SMS:%d TS:%s] Got assembled message from %s: [%s]\n", PVT_ID(pvt), (int)udh.ref, ast_str_buffer(scts_str),
+                         ast_str_buffer(oa), ast_str_buffer(fullmsg));
+            } else {
+                msg_ack = TRIBOOL_TRUE;
+                msg_ack_uid = (int)udh.ref;
                 msg_complete = 1;
                 ast_verb(2, "[%s][SMS:%d TS:%s] Got message part from %s: [%s]\n", PVT_ID(pvt), (int)udh.ref, ast_str_buffer(scts_str), ast_str_buffer(oa),
                          ast_str_buffer(msg));
@@ -1771,9 +1990,8 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
                          ast_str_buffer(oa));
             }
 
-            /* MT delivery: queue the incoming SMS for SIP/Flexisip delivery (before Local channel) */
-            {
-                char mid[MT_MID_LEN];
+            /* MT delivery: queue before starting the Local channel. SIM-backed flow queued it before CMGD. */
+            if (!persist_sim_part) {
                 mt_gen_mid(PVT_ID(pvt), mid, sizeof(mid));
                 if (smsdb_mt_put(PVT_ID(pvt), mid, ast_str_buffer(oa), ast_str_buffer(fullmsg), ast_str_buffer(scts_str))) {
                     ast_log(LOG_WARNING, "[%s][SMS:%d] MT queue put failed (mid=%s)\n", PVT_ID(pvt), (int)udh.ref, mid);
@@ -1781,14 +1999,11 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
                     ast_log(LOG_NOTICE, "[%s] MT: incoming SMS queued mid=%s from %s (msg=%s)\n", PVT_ID(pvt), mid,
                             ast_str_buffer(oa), ast_str_strlen(fullmsg) ? ast_str_buffer(fullmsg) : "<empty>");
                     mt_kick();
+                    mt_queue_saved = 1;
                 }
-                ast_json_object_set(sms, "mid", ast_json_string_create(mid));
             }
-
-            if (!channel_start_local_json(pvt, "sms", ast_str_buffer(oa), "SMS", sms) && CONF_SHARED(pvt, sms_autodelete) &&
-                (cmd == RES_CMGR || cmd == RES_CMGL)) {
-                at_enqueue_delete_sms(&pvt->sys_chan, idx, TRIBOOL_NONE);
-            }
+            if (mt_queue_saved) ast_json_object_set(sms, "mid", ast_json_string_create(mid));
+            if (!persist_sim_part || mt_queue_inserted) channel_start_local_json(pvt, "sms", ast_str_buffer(oa), "SMS", sms);
             break;
         }
     }

@@ -27,6 +27,10 @@ set(SRC_FILES
     pdu.c
     ringbuffer.c
     smsdb.c
+    sms_incoming_schema.c
+    sms_multipart.c
+    sms_delete_state.c
+    sms_delete_flow.c
     sms_paging.c
     sms_tx.c
     tty.c

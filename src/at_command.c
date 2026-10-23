@@ -20,6 +20,7 @@
 
 #include <asterisk/causes.h>
 #include <asterisk/utils.h>
+#include <time.h>
 
 #include "at_command.h"
 
@@ -30,6 +31,7 @@
 #include "error.h"
 #include "pdu.h" /* build_pdu() */
 #include "smsdb.h"
+#include "sms_delete_state.h"
 
 DECLARE_AT_CMD(at, "");
 DECLARE_AT_CMD(chld2, "+CHLD=2");
@@ -992,20 +994,54 @@ void at_sms_retrieved(struct cpvt* cpvt, int confirm)
 
 int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat)
 {
+    DECLARE_AT_CMDNT(cpms, "+CPMS=\"SM\",\"SM\",\"SM\"");
     DECLARE_AT_CMDNT(cmgl, "+CMGL=%d");
 
-    at_queue_cmd_t cmd = ATQ_CMD_DECLARE_DYN(CMD_AT_CMGL);
-
-    if (at_fill_generic_cmd(&cmd, AT_CMD(cmgl), (int)stat)) {
+    at_queue_cmd_t cmds[] = {ATQ_CMD_DECLARE_DYN(CMD_AT_CPMS), ATQ_CMD_DECLARE_DYN(CMD_AT_CMGL)};
+    if (at_fill_generic_cmd(&cmds[0], AT_CMD(cpms)) || at_fill_generic_cmd(&cmds[1], AT_CMD(cmgl), (int)stat)) {
+        at_queue_free_data(&cmds[0]);
+        at_queue_free_data(&cmds[1]);
         chan_quectel_err = E_CMD_FORMAT;
         return -1;
     }
 
-    if (at_queue_insert(cpvt, &cmd, 1u, 0)) {
+    if (at_queue_insert(cpvt, cmds, 2u, 0)) {
         chan_quectel_err = E_QUEUE;
         return -1;
     }
+    return 0;
+}
 
+int at_enqueue_sms_delete_verify(struct cpvt* cpvt, long long rowid, int idx)
+{
+    DECLARE_AT_CMDNT(cpms, "+CPMS=\"SM\",\"SM\",\"SM\"");
+    DECLARE_AT_CMDNT(cmgl, "+CMGL=%d");
+    struct pvt* const pvt = cpvt->pvt;
+    at_queue_cmd_t cmds[] = {ATQ_CMD_DECLARE_DYN(CMD_AT_CPMS), ATQ_CMD_DECLARE_DYN(CMD_AT_CMGL)};
+    if (rowid <= 0 || idx < 0 || pvt->sms_verify_active ||
+        at_fill_generic_cmd(&cmds[0], AT_CMD(cpms)) || at_fill_generic_cmd(&cmds[1], AT_CMD(cmgl), (int)MSG_STAT_ALL)) {
+        at_queue_free_data(&cmds[0]);
+        at_queue_free_data(&cmds[1]);
+        return -1;
+    }
+    if (smsdb_incoming_delete_apply(rowid, SMS_DELETE_EVENT_VERIFY_START,
+                                    (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL)) {
+        at_queue_free_data(&cmds[0]);
+        at_queue_free_data(&cmds[1]);
+        return -1;
+    }
+    pvt->sms_verify_rowid = rowid;
+    pvt->sms_verify_index = idx;
+    pvt->sms_verify_found = 0;
+    pvt->sms_verify_active = 1;
+    if (at_queue_insert_sms_verify(cpvt, cmds, 2u, rowid, 1)) {
+        pvt->sms_verify_active = 0;
+        pvt->sms_verify_rowid = 0;
+        pvt->sms_verify_index = -1;
+        smsdb_incoming_delete_apply(rowid, SMS_DELETE_EVENT_VERIFY_READ_ERROR,
+                                    (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
+        return -1;
+    }
     return 0;
 }
 
@@ -1017,10 +1053,11 @@ int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat)
  */
 int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type)
 {
+    DECLARE_AT_CMDNT(cpms, "+CPMS=\"SM\",\"SM\",\"SM\"");
     DECLARE_AT_CMDNT(cmgr, "+CMGR=%d");
 
     struct pvt* const pvt = cpvt->pvt;
-    at_queue_cmd_t cmd    = ATQ_CMD_DECLARE_DYN(CMD_AT_CMGR);
+    at_queue_cmd_t cmds[] = {ATQ_CMD_DECLARE_DYN(CMD_AT_CPMS), ATQ_CMD_DECLARE_DYN(CMD_AT_CMGR)};
 
     /* check if message is already being received */
     if (pvt->incoming_sms_index >= 0) {
@@ -1031,12 +1068,14 @@ int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type)
     pvt->incoming_sms_index = idx;
     pvt->incoming_sms_type  = sms_type;
 
-    if (at_fill_generic_cmd(&cmd, AT_CMD(cmgr), idx)) {
+    if (at_fill_generic_cmd(&cmds[0], AT_CMD(cpms)) || at_fill_generic_cmd(&cmds[1], AT_CMD(cmgr), idx)) {
+        at_queue_free_data(&cmds[0]);
+        at_queue_free_data(&cmds[1]);
         chan_quectel_err = E_CMD_FORMAT;
         goto error;
     }
 
-    if (at_queue_insert(cpvt, &cmd, 1u, 0)) {
+    if (at_queue_insert(cpvt, cmds, 2u, 0)) {
         chan_quectel_err = E_QUEUE;
         goto error;
     }
@@ -1078,6 +1117,21 @@ DECLARE_AT_CMD(cnma, "+CNMA");
  * \param index -- index of message in store
  * \return 0 on success
  */
+int at_enqueue_delete_sms_row(struct cpvt* cpvt, int idx, long long rowid)
+{
+    DECLARE_AT_CMDNT(cmgd, "+CMGD=%d");
+    at_queue_cmd_t cmd = ATQ_CMD_DECLARE_DYN(CMD_AT_CMGD);
+    if (idx < 0 || rowid <= 0 || at_fill_generic_cmd(&cmd, AT_CMD(cmgd), idx)) {
+        chan_quectel_err = E_CMD_FORMAT;
+        return -1;
+    }
+    if (at_queue_insert_sms_delete(cpvt, &cmd, rowid, 1)) {
+        chan_quectel_err = E_QUEUE;
+        return -1;
+    }
+    return 0;
+}
+
 int at_enqueue_delete_sms(struct cpvt* cpvt, int idx, tristate_bool_t ack)
 {
     DECLARE_AT_CMDNT(cmgd, "+CMGD=%d");

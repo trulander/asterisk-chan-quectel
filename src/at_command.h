@@ -150,11 +150,17 @@ int at_enqueue_reset(struct cpvt* cpvt);
 int at_enqueue_dial(struct cpvt* cpvt, const char* number, int clir);
 int at_enqueue_answer(struct cpvt* cpvt);
 int at_enqueue_user_cmd(struct cpvt* cpvt, const char* input);
+/*! Select SIM storage explicitly, then list messages from that store. */
 int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat);
+/*! Select SIM storage explicitly before reading an indexed incoming message. */
 int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type);
 void at_sms_retrieved(struct cpvt* cpvt, int confirm);
 int at_enqueue_cmgd(struct cpvt* cpvt, unsigned int index, int delflag);
 int at_enqueue_delete_sms(struct cpvt* cpvt, int idx, tristate_bool_t ack);
+/*! Queue CMGD while carrying the durable segment rowid into its completion/error callback. */
+int at_enqueue_delete_sms_row(struct cpvt* cpvt, int idx, long long rowid);
+/*! Queue a fresh SM listing for an uncertain deletion; never resends the old CMGD. */
+int at_enqueue_sms_delete_verify(struct cpvt* cpvt, long long rowid, int idx);
 int at_enqueue_delete_sms_n(struct cpvt* cpvt, int idx, tristate_bool_t ack);
 int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause);
 int at_enqueue_volsync(struct cpvt* cpvt);

@@ -24,7 +24,8 @@ int at_parse_qspn(char* str, char** fnn, char** snn, char** spn);
 int at_parse_cspn(char*, char**);
 int at_parse_qnwinfo(char* str, int* act, int* oper, char** band, int* channel);
 int at_parse_creg(char* str, int cereg, int* gsm_reg_status, char** lac, char** ci, int* act);
-int at_parse_cmti(const char* str, int* idx);
+/*! Parse +CMTI memory and index separately so unsupported stores (ME) are never treated as SIM cells. */
+int at_parse_cmti(const char* str, char* storage, size_t storage_len, int* idx);
 int at_parse_cdsi(const char* str, int* idx);
 int at_parse_cmgr(char* str, size_t len, int* tpdu_type, char* sca, size_t sca_len, char* oa, size_t oa_len, struct ast_tm* scts, int* mr, int* st,
                   struct ast_tm* dt, char* msg, size_t* msg_len, pdu_udh_t* udh);

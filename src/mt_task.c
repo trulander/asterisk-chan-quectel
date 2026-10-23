@@ -30,6 +30,8 @@
 #include <asterisk/logger.h>
 #include <asterisk/res_pjsip.h>
 
+#include "at_command.h"
+#include "at_response.h"
 #include "at_read.h" /* at_wait() */
 #include "chan_quectel.h"
 #include "eventfd.h"
@@ -577,6 +579,52 @@ void mt_send_imdn_receipt(const char* device, const char* imdn_id, const char* t
 /*!
  * \brief Process all due mt_queue rows (new or retrying) once.
  */
+static void mt_process_sms_db_read_retries(void)
+{
+    if (!gpublic) {
+        return;
+    }
+    const int now = (int)time(NULL);
+    struct pvt* pvt;
+    AST_RWLIST_RDLOCK(&gpublic->devices);
+    AST_RWLIST_TRAVERSE(&gpublic->devices, pvt, entry) {
+        ast_mutex_lock(&pvt->lock);
+        if (pvt->sms_db_retry_index >= 0 && pvt->sms_db_retry_at <= now && pvt->initialized &&
+            CONF_SHARED(pvt, sms_autodelete) && !pvt->sms_verify_active) {
+            const int idx = pvt->sms_db_retry_index;
+            if (!at_enqueue_retrieve_sms(&pvt->sys_chan, idx, RES_CMTI)) {
+                pvt->sms_db_retry_at = now + CONF_GLOBAL(mt_retry_interval);
+            }
+        }
+        ast_mutex_unlock(&pvt->lock);
+    }
+    AST_RWLIST_UNLOCK(&gpublic->devices);
+}
+
+static void mt_process_sms_delete_due(void)
+{
+    long long rowid = 0;
+    char device[DEVNAMELEN];
+    int index = -1;
+    const int due = smsdb_incoming_delete_job(&rowid, device, sizeof(device), &index);
+    if (due <= 0) {
+        return;
+    }
+    RAII_VAR(struct pvt*, pvt, pvt_find(device), pvt_unlock);
+    if (!pvt || !CONF_SHARED(pvt, sms_autodelete) || pvt->sms_verify_active || !pvt->initialized) {
+        /* Do not let a missing/disabled/busy modem monopolize the first due
+         * row; defer it without consuming a deletion attempt, then pick again
+         * on the next periodic pass. Autodelete-off never sends AT. */
+        if (smsdb_incoming_delete_defer(rowid, (int)time(NULL) + CONF_GLOBAL(mt_retry_interval))) {
+            ast_log(LOG_WARNING, "[%s][SMS:%d] Could not defer temporarily non-actionable SIM delete job\n", device, index);
+        }
+        return;
+    }
+    if (at_enqueue_sms_delete_verify(&pvt->sys_chan, rowid, index)) {
+        ast_log(LOG_WARNING, "[%s][SMS:%d] Could not queue periodic SIM-cell verification\n", device, index);
+    }
+}
+
 static void mt_process_due(void)
 {
     const int max_attempts = CONF_GLOBAL(mt_retry_max_attempts);
@@ -601,6 +649,8 @@ static void* mt_retry_threadproc(void* arg)
         }
 
         mt_process_due();
+        mt_process_sms_delete_due();
+        mt_process_sms_db_read_retries();
         if (!mt_task_started) {
             break;
         }

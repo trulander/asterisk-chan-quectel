@@ -100,6 +100,8 @@ typedef struct at_queue_task {
     unsigned cindex;
     struct cpvt* cpvt;
     int uid;
+    long long sms_delete_rowid; /*!< Durable segment row whose pending deletion this CMGD response completes. */
+    long long sms_verify_rowid; /*!< Row whose source cell this task's CMGL list verifies; distinguishes this scan from generic CMGL tasks. */
     unsigned at_once:1;
     at_queue_cmd_t cmds[0]; /* this field must be last */
 } at_queue_task_t;
@@ -110,6 +112,10 @@ int at_queue_insert_const(struct cpvt* cpvt, const at_queue_cmd_t* cmds, unsigne
 int at_queue_insert_const_at_once(struct cpvt* cpvt, const at_queue_cmd_t* cmds, unsigned cmdsno, int athead);
 int at_queue_insert(struct cpvt* cpvt, at_queue_cmd_t* cmds, unsigned cmdsno, int athead);
 int at_queue_insert_uid(struct cpvt* cpvt, at_queue_cmd_t* cmds, unsigned cmdsno, int athead, int uid);
+/*! Insert a CMGD task carrying the durable segment rowid through its response callback. */
+int at_queue_insert_sms_delete(struct cpvt* cpvt, at_queue_cmd_t* cmd, long long rowid, int athead);
+/*! Insert CPMS+CMGL as one correlated task so only its final listing can complete verification. */
+int at_queue_insert_sms_verify(struct cpvt* cpvt, at_queue_cmd_t* cmds, unsigned cmdsno, long long rowid, int athead);
 void at_queue_handle_result(struct pvt* pvt, at_res_t res);
 void at_queue_flush(struct pvt* pvt);
 const at_queue_task_t* at_queue_head_task(const struct pvt* pvt);

@@ -11,6 +11,7 @@
 #include <errno.h>  /* errno */
 #include <stdio.h>  /* NULL */
 #include <stdlib.h> /* strtol */
+#include <string.h>
 
 #include "ast_config.h"
 
@@ -406,25 +407,25 @@ int at_parse_creg(char* str, int cereg, int* gsm_reg_status, char** lac, char** 
     return 0;
 }
 
-int at_parse_cmti(const char* str, int* idx)
+int at_parse_cmti(const char* str, char* storage, size_t storage_len, int* idx)
 {
-    /*
-     * Parse cmti info in the following format:
-     *
-     *   +CMTI: <mem>,<index>
-     *
-     * Example:
-     *
-     *   +CMTI: ,2
-     *   +CMTI: ,-1
-     */
-
+    /* Parse +CMTI: <mem>,<index>; retain the memory name for safe CMGR/CMGD. */
+    char mem[32];
     int lidx;
-    const int res = sscanf(str, "+CMTI:%*[^,],%d", &lidx);
-    if (res != 1) {
+    if (!storage || !storage_len || !idx) return -1;
+    if (sscanf(str, "+CMTI: \"%31[^\"]\",%d", mem, &lidx) != 2 && sscanf(str, "+CMTI: %31[^,],%d", mem, &lidx) != 2) {
         return -1;
     }
-
+    size_t length = strlen(mem);
+    const char* memory_name = mem;
+    if (length >= 2 && mem[0] == '"' && mem[length - 1] == '"') {
+        mem[length - 1] = '\0';
+        memory_name = mem + 1;
+        length -= 2;
+    }
+    if (length >= storage_len) return -1;
+    memcpy(storage, memory_name, length);
+    storage[length] = '\0';
     *idx = lidx;
     return 0;
 }

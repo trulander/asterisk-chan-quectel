@@ -123,8 +123,14 @@ typedef struct pvt {
     struct ast_format_cap* local_format_cap;
 
     /* SMS support */
-    int incoming_sms_index;
-    int incoming_sms_type;
+    int incoming_sms_index; /*!< CMGR index currently being fetched; -1 when idle. */
+    int incoming_sms_type; /*!< Response origin used by the existing SMS acknowledgement path. */
+    long long sms_verify_rowid; /*!< Durable segment that owns the active fresh CMGL verification. */
+    int sms_verify_index; /*!< SIM index correlated to sms_verify_rowid for this scan. */
+    unsigned sms_verify_active:1; /*!< Prevent overlapping verify scans and gate target-cell matching. */
+    unsigned sms_verify_found:1; /*!< A parsed CMGL entry proved the target cell is present. */
+    int sms_db_retry_index; /*!< Volatile fallback for a SIM read not durably recorded in DB. */
+    int sms_db_retry_at; /*!< Earliest periodic reread time for sms_db_retry_index. */
 
     struct ast_tm module_time;
 

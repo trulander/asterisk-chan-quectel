@@ -49,6 +49,23 @@ struct smsdb_mt_out_row {
 int smsdb_init();
 void smsdb_atexit();
 int smsdb_put(const char* id, const char* addr, int ref, int parts, int order, const char* msg, struct ast_str** out);
+/*! Store a SIM segment and retain it until its delivery group is queued and all source cells are confirmed empty.
+ * The helper commits segment and assembly atomically under the SMS DB mutex; storage must be SM. */
+int smsdb_put_sim(const char* id, const char* addr, int ref, int parts, int order, const char* msg, const char* storage, int index, struct ast_str** out, long long* rowid);
+/*! Apply and durably commit one deletion transition for exactly rowid and its stored source identity. */
+int smsdb_incoming_delete_apply(long long rowid, int event, int retry_at, int* status, unsigned* attempts);
+/*! Return 1 and the existing MID when this stable segment group already has a durable MT row; 0 means not yet queued.
+ * Called before generating a candidate MID so a normal reread does not allocate another queue identity. */
+int smsdb_incoming_group_mt_mid(const char* id, const char* addr, int ref, int parts, const char* storage, int index, char* mid, size_t mid_len);
+/*! Atomically insert the MT row and durable group marker, or return the existing MID without another insert.
+ * The explicit DB mutex is held across BEGIN through COMMIT/ROLLBACK. */
+int smsdb_mt_queue_incoming_group(const char* id, const char* addr, int ref, int parts, const char* storage, int index,
+                                  const char* candidate_mid, const char* from_num, const char* message, const char* timestamp,
+                                  char* effective_mid, size_t effective_mid_len, int* inserted);
+/*! Pick one due SM cell job, including ambiguous CMGD_SENT for fresh-read recovery. */
+int smsdb_incoming_delete_job(long long* rowid, char* device, size_t device_len, int* index);
+/*! Defer a temporarily non-actionable due row without changing delete status or failure count. */
+int smsdb_incoming_delete_defer(long long rowid, int retry_at);
 int smsdb_get_refid(const char* id, const char* addr);
 int smsdb_outgoing_add(const char* id, const char* addr, const char* msg, int cnt, int ttl, int srr);
 int smsdb_outgoing_clear(int uid, struct ast_str** dst, struct ast_str** msg);
