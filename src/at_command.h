@@ -157,9 +157,17 @@ int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type);
 void at_sms_retrieved(struct cpvt* cpvt, int confirm);
 int at_enqueue_cmgd(struct cpvt* cpvt, unsigned int index, int delflag);
 int at_enqueue_delete_sms(struct cpvt* cpvt, int idx, tristate_bool_t ack);
-/*! Queue CMGD while carrying the durable segment rowid into its completion/error callback. */
+/** Поставить CMGD для SM/index и сохранить durable rowid в callback task.
+ * cpvt и индекс должны соответствовать текущему выбранному модему; rowid > 0 связывает
+ * ответ с exact incoming_msg segment. Возвращает 0 при принятии задачи, отрицательное
+ * при неверных аргументах/ошибке queue. Не подтверждает фактическое удаление: state
+ * становится окончательным только по ответу модема. Владение cpvt остаётся у caller.
+ */
 int at_enqueue_delete_sms_row(struct cpvt* cpvt, int idx, long long rowid);
-/*! Queue a fresh SM listing for an uncertain deletion; never resends the old CMGD. */
+/** Поставить свежий CPMS(SM)+CMGL scan для uncertain CMGD; прежний CMGD не replay-ится.
+ * rowid/index должны указывать на одну durable source row. Возвращает queue result;
+ * scan/task correlation освобождается обычным AT task lifecycle, caller не владеет им.
+ */
 int at_enqueue_sms_delete_verify(struct cpvt* cpvt, long long rowid, int idx);
 int at_enqueue_delete_sms_n(struct cpvt* cpvt, int idx, tristate_bool_t ack);
 int at_enqueue_hangup(struct cpvt* cpvt, int call_idx, int release_cause);

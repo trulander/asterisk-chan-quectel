@@ -34,6 +34,7 @@
 #include "sms_delete_state.h"
 #include "sms_multipart.h"
 #include "sms_incoming_schema.h"
+#include "sms_incoming_paging.h"
 
 /* Map the dependency-free transaction logging hook to ast_log so every
  * BEGIN/COMMIT/ROLLBACK failure surfaces in messages with the thread-id and the
@@ -251,6 +252,7 @@ static void stmt_end(int level, const char* file, int line, const char* function
     void _stmt_dtor_##s(sqlite3_stmt* const* s) { stmt_end(LOG_ERROR, *s); } \
     sqlite3_stmt* const s __attribute__((cleanup(_stmt_dtor_##s))) = stmt_begin(LOG_WARNING, s##_stmt)
 
+/** Открыть одну schema transaction под SMS_TX_SCOPE; любая DDL/migration ошибка откатывает scope. */
 static int db_create(void)
 {
     // TABLE: outgoing_msg(KEY: IMSI/DEST_ADDR)
@@ -474,6 +476,10 @@ static int db_init()
  * \retval <=0 Error
  * \retval >0 Current number of messages in the DB
  */
+/** Основная put transaction: сохранить SIM-сегмент, собрать лишь при ожидаемом count,
+ * при необходимости удерживать source rows. Mutex принадлежит операции от BEGIN до
+ * COMMIT/ROLLBACK; SQLite-буфер assembly освобождается на каждом failure пути.
+ */
 static int smsdb_put_internal(const char* id, const char* addr, int ref, int parts, int order, const char* msg, const char* source_device,
                               const char* storage, int index, int retain_parts, struct ast_str** out, long long* rowid)
 {
@@ -520,11 +526,13 @@ static int smsdb_put_internal(const char* id, const char* addr, int ref, int par
     return res;
 }
 
+/** Legacy receive API: non-SIM callers use the same transaction without a deletable source cell. */
 int smsdb_put(const char* id, const char* addr, int ref, int parts, int order, const char* msg, struct ast_str** out)
 {
     return smsdb_put_internal(id, addr, ref, parts, order, msg, NULL, NULL, -1, 0, out, NULL);
 }
 
+/** SIM-aware wrapper: отклоняет storage кроме SM и выдаёт durable rowid для delete flow. */
 int smsdb_put_sim(const char* id, const char* addr, int ref, int parts, int order, const char* msg, const char* storage, int index,
                   struct ast_str** out, long long* rowid)
 {
@@ -534,6 +542,7 @@ int smsdb_put_sim(const char* id, const char* addr, int ref, int parts, int orde
     return smsdb_put_internal(id, addr, ref, parts, order, msg, id, storage, index, 1, out, rowid);
 }
 
+/** Построить stable multipart key из modem/SMS полей; ast_str остаётся во владении caller. */
 static int smsdb_group_key(struct ast_str** key, const char* id, const char* addr, int ref, int parts, const char* storage, int index)
 {
     if (parts == 1 && !ast_strlen_zero(storage) && index >= 0) {
@@ -542,16 +551,19 @@ static int smsdb_group_key(struct ast_str** key, const char* id, const char* add
     return ast_str_set(key, 0, "%s/%s/%d/%d", id, addr, ref, parts) < 0 ? -1 : 0;
 }
 
+/** Под общей DB transaction выполнить sweep только для queued и полностью complete групп. */
 static int smsdb_gc_completed_groups(void)
 {
     return sms_incoming_gc_completed_groups(smsdb);
 }
 
+/** Проверить eligibility и условно GC одну stable group; вызывается при удержанном mutex. */
 static int smsdb_maybe_gc_group(const struct ast_str* key)
 {
     return sms_incoming_gc_group(smsdb, ast_str_buffer(key));
 }
 
+/** Сформировать group key и получить прежний committed MID до генерации candidate identity. */
 int smsdb_incoming_group_mt_mid(const char* id, const char* addr, int ref, int parts, const char* storage, int index, char* mid, size_t mid_len)
 {
     RAII_VAR(struct ast_str*, key, ast_str_create(DBKEY_DEF_LEN), ast_free);
@@ -563,6 +575,7 @@ int smsdb_incoming_group_mt_mid(const char* id, const char* addr, int ref, int p
     return queued ? 1 : 0;
 }
 
+/** Удерживать mutex DB от BEGIN через marker lookup, MT insert, marker, GC до commit/rollback. */
 int smsdb_mt_queue_incoming_group(const char* id, const char* addr, int ref, int parts, const char* storage, int index,
                                   const char* candidate_mid, const char* from_num, const char* message, const char* timestamp,
                                   char* effective_mid, size_t effective_mid_len, int* inserted)
@@ -587,6 +600,7 @@ int smsdb_mt_queue_incoming_group(const char* id, const char* addr, int ref, int
     return 0;
 }
 
+/** Сохранить один state transition и подходящий group GC в общей mutex-held transaction. */
 int smsdb_incoming_delete_apply(long long rowid, int event, int retry_at, int* status, unsigned* attempts)
 {
     int res;
@@ -641,6 +655,7 @@ int smsdb_incoming_delete_apply(long long rowid, int event, int retry_at, int* s
     return 0;
 }
 
+/** Кратко захватить mutex для выбора due SM row; modem/AT действия под lock не выполняются. */
 int smsdb_incoming_delete_job(long long* rowid, char* device, size_t device_len, int* index)
 {
     if (!rowid || !device || !device_len || !index) {
@@ -650,6 +665,7 @@ int smsdb_incoming_delete_job(long long* rowid, char* device, size_t device_len,
     return sms_incoming_delete_job_pick(smsdb, (int)time(NULL), rowid, device, device_len, index);
 }
 
+/** Сохранить только retry_at fairness defer под DB mutex, не меняя status/attempts. */
 int smsdb_incoming_delete_defer(long long rowid, int retry_at)
 {
     sqlite3_mutex* const db_mtx __attribute__((cleanup(_sms_tx_mtx_close))) = sms_tx_lock(smsdb);
@@ -1551,6 +1567,20 @@ int smsdb_sms_count(const char* device, int* total)
                 (device && !ast_strlen_zero(device)) ? device : "(all)", sqlite3_errcode(smsdb), sqlite3_errmsg(smsdb));
     }
     return res;
+}
+
+/** Сериализовать read-only pager на общем connection; callback вызывается пока mutex удержан. */
+int smsdb_incoming_parts_page(const char* device, int page_size, int offset, void* ctx, sms_incoming_page_cb cb)
+{
+    SCOPED_DB(smsdb);
+    return sms_incoming_paging_page(smsdb, device, page_size, offset, ctx, cb);
+}
+
+/** Сериализовать COUNT incoming_msg и освободить общий DB mutex до возврата. */
+int smsdb_incoming_parts_count(const char* device, int* total)
+{
+    SCOPED_DB(smsdb);
+    return sms_incoming_paging_count(smsdb, device, total);
 }
 
 int smsdb_vacuum_into(const char* backup_file)

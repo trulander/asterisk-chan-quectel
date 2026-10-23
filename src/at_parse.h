@@ -24,7 +24,14 @@ int at_parse_qspn(char* str, char** fnn, char** snn, char** spn);
 int at_parse_cspn(char*, char**);
 int at_parse_qnwinfo(char* str, int* act, int* oper, char** band, int* channel);
 int at_parse_creg(char* str, int cereg, int* gsm_reg_status, char** lac, char** ci, int* act);
-/*! Parse +CMTI memory and index separately so unsupported stores (ME) are never treated as SIM cells. */
+/** Разобрать +CMTI и сохранить storage отдельно от индекса.
+ * \param str NUL-terminated unsolicited indication.
+ * \param storage выходной буфер с размером storage_len; получает имя вроде SM.
+ * \param storage_len размер буфера с завершающим NUL; малый буфер — ошибка.
+ * \param idx обязательный output неотрицательного modem index.
+ * \return 0 при корректной строке, отрицательное значение при синтаксисе/аргументе.
+ * Caller владеет буфером. Storage нужен для того, чтобы ME не принимался за SIM.
+ */
 int at_parse_cmti(const char* str, char* storage, size_t storage_len, int* idx);
 int at_parse_cdsi(const char* str, int* idx);
 int at_parse_cmgr(char* str, size_t len, int* tpdu_type, char* sca, size_t sca_len, char* oa, size_t oa_len, struct ast_tm* scts, int* mr, int* st,

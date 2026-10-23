@@ -1,5 +1,10 @@
 #include "sms_delete_state.h"
 
+/** Проверить и применить разрешённый переход без SQL side effect.
+ * VERIFYING counted и uncounted разведены намеренно: только первая ветка
+ * подтверждает прежнюю ошибку CMGD и увеличивает лимит; восстановление после
+ * неопределённой команды не должно ошибочно расходовать попытку.
+ */
 int sms_delete_state_apply(sms_delete_state_t* const state, sms_delete_event_t event)
 {
     if (!state) return -1;
@@ -41,9 +46,9 @@ int sms_delete_state_apply(sms_delete_state_t* const state, sms_delete_event_t e
             state->status = SMS_DELETE_COMPLETE;
             return 0;
         case SMS_DELETE_EVENT_VERIFY_PRESENT_SAVED:
-            /* VERIFYING is entered from VERIFY, which is set only after CMGD
-             * ERROR/TIMEOUT. Count only after the fresh-present segment COMMIT.
-             * A recovered CMGD_SENT row instead uses VERIFYING_UNCOUNTED. */
+            /* VERIFYING достижим только из VERIFY после CMGD ERROR/TIMEOUT.
+             * Учитываем failure лишь после COMMIT свежепрочитанного сегмента.
+             * Восстановленный CMGD_SENT использует VERIFYING_UNCOUNTED. */
             if (state->status == SMS_DELETE_VERIFYING) {
                 if (state->attempts < SMS_DELETE_MAX_ATTEMPTS) ++state->attempts;
                 state->status = state->attempts >= SMS_DELETE_MAX_ATTEMPTS ? SMS_DELETE_STOPPED : SMS_DELETE_PENDING;

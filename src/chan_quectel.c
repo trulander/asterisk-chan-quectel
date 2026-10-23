@@ -193,6 +193,7 @@ void pvt_disconnect(struct pvt* pvt)
     pvt->outgoing_sms       = 0;
     pvt->incoming_sms_index = -1;
     pvt->incoming_sms_type  = RES_UNKNOWN;
+    /* При переинициализации не переносить correlation старого SIM scan/retry. */
     pvt->sms_verify_rowid = 0;
     pvt->sms_verify_index = -1;
     pvt->sms_verify_active = 0;
@@ -1195,6 +1196,7 @@ static struct pvt* pvt_create(const pvt_config_t* settings)
     pvt->has_sms            = SCONFIG(settings, msg_direct) ? 0 : 1;
     pvt->incoming_sms_index = -1;
     pvt->incoming_sms_type  = RES_UNKNOWN;
+    /* Новая pvt начинается без rowid-correlated verification и без volatile retry. */
     pvt->sms_verify_rowid = 0;
     pvt->sms_verify_index = -1;
     pvt->sms_verify_active = 0;

@@ -2,6 +2,12 @@
 
 #include <string.h>
 
+/** Применить production policy к одному результату чтения SIM.
+ * Проверяет gate/source/storage прежде callbacks; каждый побочный шаг вызывается
+ * только после успеха предыдущего, а временный сбой передаётся defer_retry.
+ * Аргументы и коды результата подробно описаны в sms_delete_flow.h; функция
+ * не удерживает SQLite lock и сама не отправляет AT-команду.
+ */
 int sms_delete_flow_process(const sms_flow_request_t* request, sms_flow_read_result_t read_result,
                             const sms_flow_ops_t* ops, void* context, sms_flow_result_t* result)
 {

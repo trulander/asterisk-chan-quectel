@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+/** Сохранить одну входящую MT queue row; строки caller-owned, SQL statement локальный. */
 int sms_mt_queue_put(sqlite3* db, const char* device, const char* mid, const char* from_num, const char* message, const char* timestamp)
 {
     static const char sql[] = "INSERT OR IGNORE INTO mt_queue(device,mid,from_num,msg,ts,state) VALUES(?,?,?,?,?,'new')";
@@ -16,11 +17,13 @@ int sms_mt_queue_put(sqlite3* db, const char* device, const char* mid, const cha
     return result;
 }
 
+/** Связать NULL/пустой optional source как SQL NULL, остальное как transient copy. */
 static int bind_nullable_text(sqlite3_stmt* stmt, int column, const char* value)
 {
     return value && *value ? sqlite3_bind_text(stmt, column, value, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(stmt, column);
 }
 
+/** Вставить/обновить часть, определить count, собрать ordered payload и при legacy режиме GC. */
 int sms_multipart_put(sqlite3* db, const char* key, int seqorder, int parts, int ttl, const char* message, const char* source_device,
                      const char* source_storage, int source_index, int retain_parts, char** assembled, long long* rowid)
 {

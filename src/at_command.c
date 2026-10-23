@@ -976,9 +976,10 @@ int at_enqueue_user_cmd(struct cpvt* cpvt, const char* input)
     return 0;
 }
 
-/*!
- * \brief Start reading next SMS, if any
- * \param cpvt -- cpvt structure
+/** Завершить текущую CMGR корреляцию и освободить per-device incoming slot.
+ * cpvt принадлежит AT pipeline; confirm ненулевой означает, что сообщение получено,
+ * иначе логируется незавершённое чтение. Функция очищает incoming_sms_index/type,
+ * но не удаляет SMS и не меняет durable incoming_msg state.
  */
 void at_sms_retrieved(struct cpvt* cpvt, int confirm)
 {
@@ -992,6 +993,10 @@ void at_sms_retrieved(struct cpvt* cpvt, int confirm)
     pvt->incoming_sms_type  = RES_UNKNOWN;
 }
 
+/** Поставить CPMS(SM)+CMGL для заданного статуса сообщений.
+ * cpvt принадлежит caller, stat — msg_status_t; return 0 означает только AT queue acceptance,
+ * -1 formatting/enqueue failure. Task владеет скопированными commands; список не удаляет ячейки.
+ */
 int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat)
 {
     DECLARE_AT_CMDNT(cpms, "+CPMS=\"SM\",\"SM\",\"SM\"");
@@ -1012,6 +1017,10 @@ int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat)
     return 0;
 }
 
+/** Поставить rowid-correlated CPMS(SM)+CMGL для fresh verification uncertain cell.
+ * rowid обязан быть положительным, idx неотрицательным; второй параллельный verify запрещён.
+ * Возвращает 0 только при queue acceptance после durable VERIFY_START; -1 при state/format/
+ * enqueue error (state defer-ится, активная volatile correlation очищается).
 int at_enqueue_sms_delete_verify(struct cpvt* cpvt, long long rowid, int idx)
 {
     DECLARE_AT_CMDNT(cpms, "+CPMS=\"SM\",\"SM\",\"SM\"");
@@ -1045,11 +1054,11 @@ int at_enqueue_sms_delete_verify(struct cpvt* cpvt, long long rowid, int idx)
     return 0;
 }
 
-/*!
- * \brief Enqueue commands for reading SMS
- * \param cpvt -- cpvt structure
- * \param index -- index of message in store
- * \return 0 on success
+/** Поставить последовательную CPMS(SM)+CMGR задачу для чтения одного SIM-сегмента.
+ * cpvt должен принадлежать устройству, idx — неотрицательный индекс SM, sms_type —
+ * исходный тип уведомления. Возвращает 0 при принятии задачи, -1 при форматировании/
+ * queue error. На время одной операции хранит idx/type в pvt; при ошибке очищает их.
+ * AT task владеет скопированными командами; DB mutex здесь не берётся.
  */
 int at_enqueue_retrieve_sms(struct cpvt* cpvt, int idx, int sms_type)
 {
@@ -1090,6 +1099,7 @@ error:
     return -1;
 }
 
+/** Сформировать обычную CMGD команду; успешный enqueue не равен modem confirmation. */
 int at_enqueue_cmgd(struct cpvt* cpvt, unsigned int idx, int delflag)
 {
     DECLARE_AT_CMDNT(cmgd, "+CMGD=%u,%d");
@@ -1117,6 +1127,7 @@ DECLARE_AT_CMD(cnma, "+CNMA");
  * \param index -- index of message in store
  * \return 0 on success
  */
+/** Поставить CMGD и прикрепить durable rowid к result callback; очередь не равна modem success. */
 int at_enqueue_delete_sms_row(struct cpvt* cpvt, int idx, long long rowid)
 {
     DECLARE_AT_CMDNT(cmgd, "+CMGD=%d");

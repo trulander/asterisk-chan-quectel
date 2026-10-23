@@ -11,32 +11,34 @@
 #include <unistd.h>
 
 static int failures;
+/* CHECK накапливает независимые ошибки SQL/flow fixture, не скрывая дальнейшие invariants. */
 #define CHECK(cond, msg) do { if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); ++failures; } } while (0)
 
 typedef struct sqlite_flow {
-    sqlite3* db;
-    const char* key;
-    const char* message;
-    const char* sender;
-    const char* timestamp;
-    const char* device;
-    const char* storage;
-    int index;
-    int order;
-    int parts;
-    long long rowid;
-    char* assembled;
-    int complete;
-    int verify;
-    int fail_commit;
-    int fail_queue_commit;
-    int queued;
-    int deleted;
-    int deferred;
-    int mid_generations;
-    char mid[64];
+    sqlite3* db; /*!< SQLite connection fixture-а; закрывается после сценария. */
+    const char* key; /*!< Заимствованный stable multipart key для production helpers. */
+    const char* message; /*!< Payload текущего сегмента; заимствован до возврата callback. */
+    const char* sender; /*!< Адрес источника, копируемый в MT row. */
+    const char* timestamp; /*!< Исходное текстовое время SMS. */
+    const char* device; /*!< SIM/device identity durable row и queue. */
+    const char* storage; /*!< Source storage, обычно SM; неподдерживаемые значения проверяют gate. */
+    int index; /*!< Индекс текущего SIM слота, сам по себе не durable identity. */
+    int order; /*!< Multipart sequence number этого сегмента. */
+    int parts; /*!< Ожидаемое общее число multipart сегментов. */
+    long long rowid; /*!< Rowid, возвращённый реальной вставкой incoming_msg. */
+    char* assembled; /*!< Результат SQLite allocator; освобождается sqlite3_free. */
+    int complete; /*!< Результат assembly в тестовом сценарии. */
+    int verify; /*!< Ненулевое значение моделирует fresh verification callback. */
+    int fail_commit; /*!< Инъекция ошибки segment/state COMMIT. */
+    int fail_queue_commit; /*!< Инъекция ошибки MT+marker COMMIT. */
+    int queued; /*!< Число наблюдённых committed queue insertions. */
+    int deleted; /*!< Число имитаций CMGD enqueue; hardware не используется. */
+    int deferred; /*!< Число scheduler defer, меняющих только retry time. */
+    int mid_generations; /*!< Число candidate MID allocation для проверки marker idempotency. */
+    char mid[64]; /*!< Effective MID: новый committed либо повторно использованный. */
 } sqlite_flow_t;
 
+/** Получить одно числовое значение настоящим SELECT; используется для DB invariants. */
 static int sql_count(sqlite3* db, const char* sql)
 {
     sqlite3_stmt* stmt = NULL;
@@ -46,7 +48,9 @@ static int sql_count(sqlite3* db, const char* sql)
     return value;
 }
 
+/** Открыть тестовую transaction; helper не владеет connection lifetime. */
 static int begin(sqlite3* db) { return sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1; }
+/** Зафиксировать transaction и вернуть ошибку, включая намеренно провоцируемый rollback case. */
 static int commit(sqlite3* db)
 {
     if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) return 0;
@@ -54,6 +58,7 @@ static int commit(sqlite3* db)
     return -1;
 }
 
+/** Найти реальную segment rowid по group key, не полагаясь на тестовый AUTOINCREMENT номер. */
 static long long rowid_for_key(sqlite3* db, const char* key)
 {
     sqlite3_stmt* stmt = NULL;
@@ -66,6 +71,7 @@ static long long rowid_for_key(sqlite3* db, const char* key)
     return rowid;
 }
 
+/** Прочитать persisted deletion state/attempts для exact durable row. */
 static int row_state(sqlite_flow_t* flow, long long rowid, sms_delete_state_t* state)
 {
     sqlite3_stmt* stmt = NULL;
@@ -80,6 +86,7 @@ static int row_state(sqlite_flow_t* flow, long long rowid, sms_delete_state_t* s
     return result;
 }
 
+/** Применить state helper и записать transition под SQLite transaction. */
 static int persist_state(sqlite_flow_t* flow, sms_delete_state_t state, int retry_at)
 {
     if (begin(flow->db)) return -1;
@@ -91,6 +98,7 @@ static int persist_state(sqlite_flow_t* flow, sms_delete_state_t state, int retr
     return commit(flow->db);
 }
 
+/** Production-flow callback на настоящей SQLite: сохранить segment через production multipart helper. */
 static int save_cell(void* opaque, sms_flow_result_t* result)
 {
     sqlite_flow_t* flow = opaque;
@@ -124,6 +132,7 @@ static int save_cell(void* opaque, sms_flow_result_t* result)
     return 0;
 }
 
+/** Вставить полную mt_queue запись и durable group marker в одной transaction. */
 static int queue_complete(void* opaque, const sms_flow_result_t* result)
 {
     sqlite_flow_t* flow = opaque;
@@ -152,11 +161,12 @@ static int queue_complete(void* opaque, const sms_flow_result_t* result)
     if (commit(flow->db)) return -1;
     memcpy(flow->mid, effective_mid, strlen(effective_mid) + 1);
     flow->queued += inserted;
-    /* MT row and marker share one committed transaction before CMGD is allowed. */
+    /* MT row и marker должны быть committed одной transaction прежде, чем разрешён CMGD. */
     if (!sqlite3_get_autocommit(flow->db) || (inserted && sql_count(flow->db, "SELECT COUNT(*) FROM mt_queue") < 1)) return -1;
     return 0;
 }
 
+/** Сохранить CMGD-sent state до тестовой имитации AT enqueue, не выполнять модем. */
 static int delete_cell(void* opaque, const sms_flow_result_t* result)
 {
     sqlite_flow_t* flow = opaque;
@@ -175,6 +185,7 @@ static int delete_cell(void* opaque, const sms_flow_result_t* result)
     return 0;
 }
 
+/** Зафиксировать empty cell и вызвать production GC только после durable transition. */
 static int mark_absent(void* opaque)
 {
     sqlite_flow_t* flow = opaque;
@@ -192,9 +203,11 @@ static int mark_absent(void* opaque)
     return commit(flow->db);
 }
 
+/** Считать scheduler defer вызовы, не меняя attempts. */
 static void defer_retry(void* opaque) { ++((sqlite_flow_t*)opaque)->deferred; }
 static const sms_flow_ops_t ops = {save_cell, queue_complete, delete_cell, mark_absent, defer_retry};
 
+/** Открыть file/in-memory SQLite и подготовить schema для crash/restart сценария. */
 static int open_database(const char* path, sqlite3** db)
 {
     if (sqlite3_open(path, db) != SQLITE_OK) return -1;
@@ -207,12 +220,14 @@ static int open_database(const char* path, sqlite3** db)
     return sqlite3_exec(*db, "DELETE FROM incoming_msg;DELETE FROM mt_queue;DELETE FROM deferred_child;", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
 }
 
+/** Собрать SIM-cell flow request с test context и выбранным complete hint. */
 static sms_flow_request_t make_request(sqlite_flow_t* flow, int complete)
 {
     sms_flow_request_t request = {1, SMS_FLOW_SIM_CELL, flow->device, flow->storage, flow->index, complete};
     return request;
 }
 
+/** Проверить реальные rows: неполная/queued группа остаётся до отсутствия всех ячеек. */
 static void test_multipart_retained_until_mt_queue_and_all_absent(const char* path)
 {
     sqlite_flow_t flow = {.key="sim-a/+123/42/3", .sender="+123", .timestamp="2026-01-01T00:00:00Z",
@@ -247,8 +262,8 @@ static void test_multipart_retained_until_mt_queue_and_all_absent(const char* pa
           "out-of-order production assembly is queued in sequence order");
     sqlite3_finalize(msg_stmt);
 
-    /* CMGD failures followed by fresh reads of the same retained group must
-     * reuse its MID, not create a new MT row on each retry. */
+    /* CMGD failure и fresh reread той же retained group должны переиспользовать MID,
+     * а не создавать новую MT row на каждом retry. */
     flow.rowid = rowids[2];
     flow.index = indices[2];
     flow.order = 2;
@@ -286,6 +301,7 @@ static void test_multipart_retained_until_mt_queue_and_all_absent(const char* pa
     sqlite3_close(flow.db);
 }
 
+/** Инъецировать commit boundary и доказать атомарность mt_queue + group marker. */
 static void test_queue_and_marker_commit_atomically(const char* path)
 {
     sqlite_flow_t flow = {.key="sim-a/+123/8/1/SM/8", .sender="+123", .timestamp="2026-01-01T00:00:00Z",
@@ -305,6 +321,7 @@ static void test_queue_and_marker_commit_atomically(const char* path)
     sqlite3_close(flow.db);
 }
 
+/** Проверить, что failed durable segment commit блокирует MT queue и delete callbacks. */
 static void test_commit_failure_never_queues_or_deletes(const char* path)
 {
     sqlite_flow_t flow = {.key="sim-a/+123/7/1/SM/8", .sender="+123", .timestamp="2026-01-01T00:00:00Z",
@@ -320,6 +337,7 @@ static void test_commit_failure_never_queues_or_deletes(const char* path)
     sqlite3_close(flow.db);
 }
 
+/** Доказать, что retry_at defer для недоступной SIM открывает picker следующей SIM. */
 static void test_blocked_due_job_does_not_starve_other_devices(const char* path)
 {
     sqlite3* db = NULL;
@@ -343,12 +361,14 @@ static void test_blocked_due_job_does_not_starve_other_devices(const char* path)
     sqlite3_close(db);
 }
 
+/** SQLite authorizer для контролируемого SQL read failure в marker lookup. */
 static int deny_incoming_select(void* context, int action, const char* arg1, const char* arg2, const char* dbname, const char* trigger)
 {
     (void)context; (void)arg2; (void)dbname; (void)trigger;
     return action == SQLITE_READ && arg1 && !strcmp(arg1, "incoming_msg") ? SQLITE_DENY : SQLITE_OK;
 }
 
+/** Проверить bound inputs, marker SQL errors и восстановление marker после reopen БД. */
 static void test_group_marker_failures_binding_and_restart(const char* path)
 {
     sqlite_flow_t flow = {.key="key-' OR 1=1 --", .sender="+1555", .timestamp="t", .device="dev-a",
@@ -392,8 +412,8 @@ static void test_group_marker_failures_binding_and_restart(const char* path)
     CHECK(sms_incoming_group_queue_state(flow.db, flow.key, &queued, mid, 1) != 0,
           "undersized MID buffer fails without writing beyond caller capacity");
 
-    /* A second group exercises failures between queue INSERT and marker UPDATE.
-     * The caller's transaction must roll both effects back on every error. */
+    /* Вторая группа проверяет failure между queue INSERT и marker UPDATE.
+     * Caller transaction обязана откатить оба изменения при ошибке. */
     CHECK(sqlite3_exec(flow.db, "INSERT INTO incoming_msg(key,seqorder,message,source_device,source_storage,source_index) VALUES('second',1,'two','dev-a','SM',18);"
           "CREATE TRIGGER reject_marker BEFORE UPDATE OF mt_queued ON incoming_msg WHEN NEW.key='second' BEGIN SELECT RAISE(ABORT,'marker failure'); END;",
           NULL, NULL, NULL) == SQLITE_OK, "seed second group and marker-write failure trigger");
@@ -415,6 +435,7 @@ static void test_group_marker_failures_binding_and_restart(const char* path)
     sqlite3_close(flow.db);
 }
 
+/** Проверить defer ограничен rowid, сохраняет state/attempts и влияет на due order. */
 static void test_retry_defer_boundaries_isolation_and_order(const char* path)
 {
     sqlite3* db = NULL;
@@ -458,6 +479,7 @@ static void test_retry_defer_boundaries_isolation_and_order(const char* path)
     sqlite3_close(db);
 }
 
+/** Перезапустить picker и убедиться, что CMGD_SENT выбирается для fresh verify, не replay. */
 static void test_restart_picker_recovers_cmgd_sent(const char* path)
 {
     sqlite_flow_t flow = {.key="sim-a/+123/9/1/SM/9", .sender="+123", .timestamp="2026-01-01T00:00:00Z",
@@ -505,6 +527,7 @@ static void test_restart_picker_recovers_cmgd_sent(const char* path)
     sqlite3_close(flow.db);
 }
 
+/** Запустить SQLite-backed queue/GC/restart/fairness scenarios с file DB и итоговым статусом. */
 int main(void)
 {
     char path[] = "/tmp/sms-delete-flow-XXXXXX";

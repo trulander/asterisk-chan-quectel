@@ -3,6 +3,7 @@
 
 static int failures;
 
+/* CHECK агрегирует ошибки теста, не прекращая проверку последующих переходов. */
 #define CHECK(test, msg) do { \
     if (!(test)) { \
         fprintf(stderr, "FAIL: %s\n", msg); \
@@ -10,6 +11,7 @@ static int failures;
     } \
 } while (0)
 
+/** Проверить CMGD OK и fresh absent как завершение без расхода failure attempts. */
 static void test_success_and_absent_do_not_consume_attempt(void)
 {
     sms_delete_state_t state = {SMS_DELETE_PENDING, 0};
@@ -26,6 +28,7 @@ static void test_success_and_absent_do_not_consume_attempt(void)
     CHECK(state.status == SMS_DELETE_COMPLETE && state.attempts == 0, "CMGD OK completes without attempt");
 }
 
+/** Проверить только durable present после CMGD failure считается; пятый переход останавливает scheduler. */
 static void test_only_confirmed_present_counts_and_stops_at_five(void)
 {
     sms_delete_state_t state = {SMS_DELETE_PENDING, 0};
@@ -42,6 +45,7 @@ static void test_only_confirmed_present_counts_and_stops_at_five(void)
     CHECK(sms_delete_state_apply(&state, SMS_DELETE_EVENT_SAVED) < 0, "stopped entry cannot be restarted by ordinary save");
 }
 
+/** Проверить, что persisted in-flight/interrupted verification после restart читает ячейку свежо. */
 static void test_restart_recovery_uses_fresh_verification(void)
 {
     sms_delete_state_t after_queued_command = {SMS_DELETE_CMGD_SENT, 2};
@@ -61,6 +65,7 @@ static void test_restart_recovery_uses_fresh_verification(void)
           "present cell after restart consumes the fifth confirmed failure");
 }
 
+/** Проверить, что локальный отказ AT enqueue не притворяется выполненным CMGD failure. */
 static void test_enqueue_failure_does_not_count(void)
 {
     sms_delete_state_t state = {SMS_DELETE_PENDING, 0};
@@ -69,6 +74,7 @@ static void test_enqueue_failure_does_not_count(void)
     CHECK(state.status == SMS_DELETE_PENDING && state.attempts == 0, "enqueue failure is not a confirmed deletion attempt");
 }
 
+/** Проверить retry для read/DB ошибок без расхода лимита и последующий подтверждённый present. */
 static void test_read_and_database_errors_do_not_count(void)
 {
     sms_delete_state_t state = {SMS_DELETE_PENDING, 2};
@@ -84,6 +90,7 @@ static void test_read_and_database_errors_do_not_count(void)
     CHECK(state.status == SMS_DELETE_PENDING && state.attempts == 3, "durably saved present cell increments once");
 }
 
+/** Запустить независимые сценарии переходов и сообщить общий результат CTest. */
 int main(void)
 {
     test_success_and_absent_do_not_consume_attempt();

@@ -100,8 +100,8 @@ typedef struct at_queue_task {
     unsigned cindex;
     struct cpvt* cpvt;
     int uid;
-    long long sms_delete_rowid; /*!< Durable segment row whose pending deletion this CMGD response completes. */
-    long long sms_verify_rowid; /*!< Row whose source cell this task's CMGL list verifies; distinguishes this scan from generic CMGL tasks. */
+    long long sms_delete_rowid; /*!< SQLite rowid сегмента, чей CMGD callback завершает delete transition; 0 означает обычную CMGD задачу. */
+    long long sms_verify_rowid; /*!< SQLite rowid владельца CMGL verification; 0 отличает обычный список SMS от correlated scan. */
     unsigned at_once:1;
     at_queue_cmd_t cmds[0]; /* this field must be last */
 } at_queue_task_t;

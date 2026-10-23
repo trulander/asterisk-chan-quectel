@@ -32,9 +32,13 @@ set(SRC_FILES
     sms_delete_state.c
     sms_delete_flow.c
     sms_paging.c
+    # Независимый от Asterisk pager для страницы сохранённых входящих сегментов.
+    sms_incoming_paging.c
     sms_tx.c
     tty.c
     web_util.c
+    # Чистые route/escaping/response helpers, используемые production и CTest.
+    web_incoming_parts.c
 )
 
 add_library(asterisk-chan-quectel SHARED ${SRC_FILES})

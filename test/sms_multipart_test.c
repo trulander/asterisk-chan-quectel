@@ -7,10 +7,12 @@
 #include "sms_tx.h"
 
 static int failures;
+/* CHECK накапливает fixture/assertion ошибки и позволяет завершить все сценарии. */
 #define CHECK(condition, message) do { \
     if (!(condition)) { fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
 } while (0)
 
+/** Создать изолированную SQLite БД для проверки production schema helpers без Asterisk. */
 static sqlite3* open_db(void)
 {
     sqlite3* db = NULL;
@@ -27,6 +29,7 @@ static sqlite3* open_db(void)
     return db;
 }
 
+/** Выполнить scalar COUNT-проверку результата в тестовой БД; -1 обозначает SQL error. */
 static int count(sqlite3* db, const char* sql)
 {
     sqlite3_stmt* stmt = NULL;
@@ -36,11 +39,13 @@ static int count(sqlite3* db, const char* sql)
     return result;
 }
 
+/** Создать очередь с указанным сообщением для проверки atomic queue/rollback. */
 static int insert_queue(sqlite3* db, const char* msg)
 {
     return sms_mt_queue_put(db, "sim-a", "one-sms", "+100", msg, "2026-01-01 00:00:00");
 }
 
+/** Проверить переход старой incoming_msg схемы к новой и безопасные defaults старых строк. */
 static void test_legacy_schema_migration(void)
 {
     sqlite3* db = NULL;
@@ -54,6 +59,7 @@ static void test_legacy_schema_migration(void)
     sqlite3_close(db);
 }
 
+/** Регрессия повторного использования SIM index: update должен затронуть только точный rowid/identity. */
 static void test_delete_state_update_is_rowid_scoped(void)
 {
     sqlite3* db = open_db();
@@ -75,6 +81,7 @@ static void test_delete_state_update_is_rowid_scoped(void)
     sqlite3_close(db);
 }
 
+/** Сохранить multipart в порядке 1,3,2; до третьего сегмента нет сборки, итоговый текст упорядочен. */
 static void test_out_of_order_1_3_2(void)
 {
     sqlite3* db = open_db();
@@ -110,6 +117,7 @@ static void test_out_of_order_1_3_2(void)
     sqlite3_close(db);
 }
 
+/** Внести SQL/COMMIT ошибки и доказать, что они не дают ложного успешного queue/delete результата. */
 static void test_database_and_commit_failures(void)
 {
     sqlite3* db = open_db();
@@ -137,6 +145,7 @@ static void test_database_and_commit_failures(void)
     sqlite3_close(db);
 }
 
+/** Последовательно запустить migration, row identity, multipart order и DB failure regressions. */
 int main(void)
 {
     test_legacy_schema_migration();

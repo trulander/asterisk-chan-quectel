@@ -1,48 +1,67 @@
 #ifndef CHAN_QUECTEL_SMS_DELETE_FLOW_H_INCLUDED
 #define CHAN_QUECTEL_SMS_DELETE_FLOW_H_INCLUDED
 
-/*! Result of the current AT/CMGL read, passed to the common orchestration seam. */
+/** Результат чтения текущей ячейки SM, полученный после CMGR или свежего CMGL.
+ * Значение отличает достоверное отсутствие SMS от ошибки чтения: только первое
+ * разрешает завершить удаление, ошибка должна оставить durable job на retry.
+ */
 typedef enum sms_flow_read_result {
-    SMS_FLOW_READ_ERROR, /*!< No reliable cell contents; schedule retry only. */
-    SMS_FLOW_CELL_ABSENT, /*!< Fresh list proves the target cell is empty. */
-    SMS_FLOW_CELL_PRESENT, /*!< Target cell was read and parsed successfully. */
+    SMS_FLOW_READ_ERROR, /*!< Ячейка не прочитана достоверно; требуется только retry без CMGD. */
+    SMS_FLOW_CELL_ABSENT, /*!< Свежий список доказал, что адресуемая ячейка пуста. */
+    SMS_FLOW_CELL_PRESENT, /*!< Содержимое ячейки успешно прочитано и может быть сохранено. */
 } sms_flow_read_result_t;
 
-/*! Distinguishes a SIM-backed cell from a direct-delivery indication. */
+/** Источник SMS: только SIM-cell имеет storage/index и подлежит удалению. */
 typedef enum sms_flow_source {
-    SMS_FLOW_SIM_CELL,
-    SMS_FLOW_RES_CMT, /*!< Unstored indication; it has no addressable cell to delete. */
+    SMS_FLOW_SIM_CELL, /*!< SMS прочитана из адресуемой ячейки SIM-хранилища. */
+    SMS_FLOW_RES_CMT, /*!< Прямое уведомление без ячейки; delete callback запрещён. */
 } sms_flow_source_t;
 
-/*! Cell identity and policy for one production incoming-message event. */
+/** Входная политика и идентичность одного события приёма SMS.
+ * Вызывающий владеет строками на всё время sms_delete_flow_process(); функция
+ * их не сохраняет после возврата. Удаление допускается только при gate и SM.
+ */
 typedef struct sms_flow_request {
-    int sms_autodelete; /*!< Explicit deletion gate; false bypasses every callback. */
-    sms_flow_source_t source; /*!< Only SMS_FLOW_SIM_CELL can reach save/delete callbacks. */
-    const char* device; /*!< Source modem identity used to correlate durable rows. */
-    const char* storage; /*!< Must be "SM"; ME is intentionally unsupported. */
-    int index; /*!< Current modem index, not a durable identity by itself. */
-    int complete; /*!< Initial assembly hint; save callback returns the authoritative result. */
+    int sms_autodelete; /*!< Ненулевое значение включает обработку SIM-cell callbacks. */
+    sms_flow_source_t source; /*!< SIM_CELL разрешает pipeline; RES_CMT исключает его. */
+    const char* device; /*!< Имя устройства, связывающее ячейку с durable source row. */
+    const char* storage; /*!< Storage модема; допустимый delete storage только "SM". */
+    int index; /*!< Текущий неотрицательный индекс ячейки; сам по себе не является durable ID. */
+    int complete; /*!< Подсказка полноты сборки; результат save callback является авторитетным. */
 } sms_flow_request_t;
 
-/*! Outputs from the durable-save callback, consumed before queue/delete callbacks. */
+/** Результат durable save, используемый далее для queue и delete callbacks.
+ * Rowid должен точно идентифицировать сохранённый сегмент, а не один лишь слот SIM.
+ */
 typedef struct sms_flow_result {
-    int complete; /*!< True only after all parts assemble in sequence. */
-    long long durable_rowid; /*!< Exact segment row to which delete state belongs. */
+    int complete; /*!< Ненулевое значение означает полную собранную SMS. */
+    long long durable_rowid; /*!< SQLite rowid сегмента, сохранённого до любых действий SIM. */
 } sms_flow_result_t;
 
-/*! Side effects supplied by production and SQLite-backed tests. Each successful
- * callback denotes a durable operation before the next callback may run. */
+/** Набор побочных операций production policy и in-memory SQLite теста.
+ * Callback success означает успешное durable завершение своей операции; следующий
+ * callback до этого результата вызываться не должен. Контекст принадлежит caller.
+ */
 typedef struct sms_flow_ops {
-    int (*save_cell)(void* context, sms_flow_result_t* result); /*!< COMMIT the current segment and return rowid/assembly status. */
-    int (*queue_complete_sms)(void* context, const sms_flow_result_t* result); /*!< Persist full MT row and group marker. */
-    int (*delete_cell)(void* context, const sms_flow_result_t* result); /*!< Persist queue state, then enqueue fresh CMGD. */
-    int (*mark_absent)(void* context); /*!< Persist confirmed absence and eligible GC. */
-    void (*defer_retry)(void* context); /*!< Record a retry without consuming a confirmed deletion failure. */
+    int (*save_cell)(void* context, sms_flow_result_t* result); /*!< COMMIT сегмента; заполнить rowid/assembly result. */
+    int (*queue_complete_sms)(void* context, const sms_flow_result_t* result); /*!< Атомарно сохранить MT row и group marker. */
+    int (*delete_cell)(void* context, const sms_flow_result_t* result); /*!< Сохранить delete state и только затем поставить свежий CMGD. */
+    int (*mark_absent)(void* context); /*!< Сохранить подтверждённое отсутствие и проверить group GC. */
+    void (*defer_retry)(void* context); /*!< Отложить временную ошибку, не расходуя deletion attempts. */
 } sms_flow_ops_t;
 
-/* Runs the stateful production sequence after an AT read: save -> optional
- * complete-message queue -> delete; absent and read-error outcomes never CMGD.
- * Returns 0 on success, 1 when policy/source excludes the event, -1 on failure. */
+/** Выполнить общий порядок действий после результата чтения AT ячейки.
+ * \param request политика, источник и точная SIM identity; обязателен.
+ * \param read_result достоверный результат свежего чтения или READ_ERROR.
+ * \param ops полный набор callbacks; callbacks синхронны и выполняют свои DB commit.
+ * \param context непрозрачный контекст, передаваемый callbacks без передачи владения.
+ * \param result выходная структура durable save; может быть NULL только если вызывающий
+ *        не использует детали (production передаёт указатель).
+ * \return 0 обработано; 1 исключено gate/source/storage; -1 временная ошибка.
+ * Pipeline сохраняет → при complete ставит durable queue → ставит CMGD; absent
+ * и read error не удаляют ячейку. Функция сама не захватывает SQLite mutex: это
+ * ответственность callback-владельца и не должно расширять lock через AT enqueue.
+ */
 int sms_delete_flow_process(const sms_flow_request_t* request, sms_flow_read_result_t read_result,
                             const sms_flow_ops_t* ops, void* context, sms_flow_result_t* result);
 

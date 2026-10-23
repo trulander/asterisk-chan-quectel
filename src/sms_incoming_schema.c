@@ -3,6 +3,7 @@
 
 #include <string.h>
 
+/** Выполнить один idempotent ALTER; duplicate-column означает уже применённую миграцию. */
 static int run_migration(sqlite3* db, const char* sql)
 {
     char* errmsg = NULL;
@@ -15,6 +16,7 @@ static int run_migration(sqlite3* db, const char* sql)
     return -1;
 }
 
+/** Обновить только rowid с совпавшим source identity; caller владеет mutex и transaction. */
 int sms_incoming_delete_state_update(sqlite3* db, long long rowid, const char* device, const char* storage, int index,
                                     int status, unsigned attempts, int retry_at)
 {
@@ -30,6 +32,7 @@ int sms_incoming_delete_state_update(sqlite3* db, long long rowid, const char* d
     return result;
 }
 
+/** Сдвинуть retry_at для валидной SM job, не меняя status/attempts при fairness defer. */
 int sms_incoming_delete_retry_defer(sqlite3* db, long long rowid, int retry_at)
 {
     static const char sql[] = "UPDATE incoming_msg SET retry_at=? WHERE rowid=? AND source_storage='SM' AND source_device IS NOT NULL AND source_index IS NOT NULL";
@@ -42,6 +45,7 @@ int sms_incoming_delete_retry_defer(sqlite3* db, long long rowid, int retry_at)
     return result;
 }
 
+/** Прочитать aggregate marker стабильной multipart группы; отсутствие group — ошибка, не empty marker. */
 int sms_incoming_group_queue_state(sqlite3* db, const char* key, int* queued, char* mid, size_t mid_len)
 {
     static const char sql[] = "SELECT COUNT(*),MIN(mt_queued),MIN(mt_mid) FROM incoming_msg WHERE key=?";
@@ -62,6 +66,7 @@ int sms_incoming_group_queue_state(sqlite3* db, const char* key, int* queued, ch
     return result;
 }
 
+/** Пометить все segment rows группы одним MID внутри внешней transaction. */
 int sms_incoming_group_mark_queued(sqlite3* db, const char* key, const char* mid)
 {
     static const char sql[] = "UPDATE incoming_msg SET mt_queued=1,mt_mid=? WHERE key=?";
@@ -74,6 +79,7 @@ int sms_incoming_group_mark_queued(sqlite3* db, const char* key, const char* mid
     return result;
 }
 
+/** Сначала reuse marker, иначе вставить MT row и marker в общей caller transaction. */
 int sms_incoming_mt_queue_group(sqlite3* db, const char* key, const char* device, const char* candidate_mid,
                                 const char* from_num, const char* message, const char* timestamp,
                                 char* effective_mid, size_t effective_mid_len, int* inserted)
@@ -98,6 +104,7 @@ int sms_incoming_mt_queue_group(sqlite3* db, const char* key, const char* device
     return 0;
 }
 
+/** Удалить выбранную группу только если queued и каждая строка complete. */
 int sms_incoming_gc_group(sqlite3* db, const char* key)
 {
     static const char select_sql[] = "SELECT COUNT(*),SUM(CASE WHEN delete_status=2 THEN 1 ELSE 0 END),MIN(mt_queued) FROM incoming_msg WHERE key=?";
@@ -120,6 +127,7 @@ done:
     return result;
 }
 
+/** Startup/repair sweep для групп, удовлетворяющих тем же queue/delete invariant. */
 int sms_incoming_gc_completed_groups(sqlite3* db)
 {
     static const char sql[] =
@@ -128,10 +136,11 @@ int sms_incoming_gc_completed_groups(sqlite3* db)
     return db && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
 }
 
+/** Выбрать первую due SM job по retry_at,rowid; WHERE отсекает неадресуемые строки. */
 int sms_incoming_delete_job_pick(sqlite3* db, int now, long long* rowid, char* device, size_t device_len, int* index)
 {
-    /* Include CMGD_SENT (4): a lost/failed OK-state DB write after modem success
-     * is ambiguous, so restart recovery must issue a fresh CMGL read, not CMGD. */
+    /* CMGD_SENT включён: потерянная/ошибочная фиксация ответа OK оставляет результат
+     * неоднозначным, поэтому restart обязан свежо прочитать ячейку, а не повторять CMGD. */
     static const char sql[] = "SELECT rowid,source_device,source_index FROM incoming_msg WHERE source_storage='SM' AND source_device IS NOT NULL AND length(trim(source_device))>0 AND typeof(source_index)='integer' AND source_index>=0 AND delete_status IN (0,1,4,5,6) AND retry_at<=? ORDER BY retry_at,rowid LIMIT 1";
     sqlite3_stmt* stmt = NULL;
     int rc, result = -1;
@@ -155,6 +164,7 @@ done:
     return result;
 }
 
+/** Создать актуальную таблицу, применить совместимые миграции и индекс идемпотентно. */
 int sms_incoming_schema_ensure(sqlite3* db)
 {
     static const char* const migrations[] = {

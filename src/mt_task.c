@@ -39,6 +39,7 @@
 #include "mt_task.h"
 #include "smsdb.h"
 #include "web_util.h"
+#include "web_incoming_parts.h"
 
 // ================================================================
 
@@ -601,6 +602,9 @@ static void mt_process_sms_db_read_retries(void)
     AST_RWLIST_UNLOCK(&gpublic->devices);
 }
 
+/** Выполнить один due delete-job за проход; недоступную SIM defer-ить для fairness.
+ * SQLite mutex держится внутри smsdb API, не вокруг AT ожидания; AT queue получает rowid.
+ */
 static void mt_process_sms_delete_due(void)
 {
     long long rowid = 0;
@@ -612,9 +616,9 @@ static void mt_process_sms_delete_due(void)
     }
     RAII_VAR(struct pvt*, pvt, pvt_find(device), pvt_unlock);
     if (!pvt || !CONF_SHARED(pvt, sms_autodelete) || pvt->sms_verify_active || !pvt->initialized) {
-        /* Do not let a missing/disabled/busy modem monopolize the first due
-         * row; defer it without consuming a deletion attempt, then pick again
-         * on the next periodic pass. Autodelete-off never sends AT. */
+        /* Недоступная/disabled/busy SIM не должна удерживать первый due row:
+         * defer выполняется без расхода deletion attempt, следующий periodic pass
+         * выберет другую job. При autodelete-off AT не отправляется. */
         if (smsdb_incoming_delete_defer(rowid, (int)time(NULL) + CONF_GLOBAL(mt_retry_interval))) {
             ast_log(LOG_WARNING, "[%s][SMS:%d] Could not defer temporarily non-actionable SIM delete job\n", device, index);
         }
@@ -853,10 +857,11 @@ static void mt_web_html_head(struct ast_str** buf, const char* title)
                    "</style></head><body>", title);
 }
 
+/** Добавить общий navigation bar; ссылка Incoming parts не меняет legacy route links. */
 static void mt_web_nav(struct ast_str** buf)
 {
     ast_str_append(buf, 0,
-                   "<p class=\"nav\"><a href=\"/\">SIM status</a> | <a href=\"/sms\">SMS history</a> | "
+                   "<p class=\"nav\"><a href=\"/\">SIM status</a> | <a href=\"/sms\">SMS history</a> | <a href=\"/sms/parts\">Incoming parts</a> | "
                    "<a href=\"/status.json\">Status JSON</a> | <a href=\"/json\">SMS JSON</a> &nbsp;|&nbsp; "
                    "<label for=\"mt-refresh\">auto-refresh:</label> "
                    "<select id=\"mt-refresh\" onchange=\"mt_setRefresh(this.value)\">"
@@ -1441,6 +1446,209 @@ static void mt_web_json(int client_fd)
 /*!
  * \brief Serve a single accepted connection, then close it.
  */
+struct incoming_html_ctx {
+    struct ast_str **buf; /*!< Указатель на ast_str renderer-а; владеет самим буфером внешний renderer. */
+};
+
+/** Использовать tested pure HTML escaper для каждой строки из incoming_msg.
+ * Выделенный буфер принадлежит этому вызову; ast_str получает его копию через append.
+ */
+static void mt_web_incoming_html_escape(struct ast_str **buf, const char *text)
+{
+    size_t needed = web_incoming_html_escape(text, NULL, 0);
+    RAII_VAR(char *, escaped, ast_malloc(needed + 1), ast_free);
+    if (!escaped) return;
+    web_incoming_html_escape(text, escaped, needed + 1);
+    ast_str_append(buf, 0, "%s", escaped);
+}
+
+/** Добавить одну скопированную pager row в HTML таблицу диагностики.
+ * ctx ссылается на renderer-owned ast_str; row действует до конца callback.
+ */
+static int incoming_html_row(void *ctx, const struct sms_incoming_page_row *row)
+{
+    struct ast_str **buf = ((struct incoming_html_ctx *)ctx)->buf;
+    ast_str_append(buf, 0, "<tr><td>%lld</td><td>", (long long)row->rowid);
+    mt_web_incoming_html_escape(buf, row->device);
+    ast_str_append(buf, 0, "</td><td>");
+    mt_web_incoming_html_escape(buf, row->storage);
+    ast_str_append(buf, 0, "</td><td>%d</td><td>", row->source_index);
+    mt_web_incoming_html_escape(buf, row->key);
+    ast_str_append(buf, 0, "</td><td>%d</td><td>", row->seqorder);
+    mt_web_incoming_html_escape(buf, row->message);
+    ast_str_append(buf, 0, "</td><td>%lld</td><td>%d</td><td>%d</td><td>%lld</td><td>%d</td><td>",
+                   (long long)row->expiration, row->delete_status, row->delete_attempts,
+                   (long long)row->retry_at, row->mt_queued);
+    mt_web_incoming_html_escape(buf, row->mt_mid);
+    ast_str_append(buf, 0, "</td></tr>");
+    return 0;
+}
+
+struct incoming_json_ctx {
+    struct ast_json *items; /*!< JSON array, принадлежащий контексту до передачи envelope/root. */
+    int failed; /*!< Ненулевой флаг: callback прекратил обход из-за allocation/encoding setup error. */
+};
+
+/** Безопасно установить JSON value; при неудаче освобождает value, владение object остаётся caller. */
+static int incoming_json_set(struct ast_json *object, const char *key, struct ast_json *value)
+{
+    if (!value) return -1;
+    if (ast_json_object_set(object, key, value)) {
+        ast_json_unref(value);
+        return -1;
+    }
+    return 0;
+}
+
+/** Собрать JSON item из одной durable segment row через Asterisk JSON API.
+ * ctx владеет items; callback возвращает nonzero при allocation failure, вызывающий
+ * pager останавливается и renderer отбрасывает весь partial array с HTTP 500.
+ */
+static int incoming_json_row(void *ctx, const struct sms_incoming_page_row *row)
+{
+    struct incoming_json_ctx *builder = ctx;
+    struct ast_json *item = ast_json_object_create();
+    if (!item) goto failed;
+    if (incoming_json_set(item, "rowid", ast_json_integer_create(row->rowid)) ||
+        incoming_json_set(item, "device", ast_json_string_create(row->device)) ||
+        incoming_json_set(item, "storage", ast_json_string_create(row->storage)) ||
+        incoming_json_set(item, "source_index", ast_json_integer_create(row->source_index)) ||
+        incoming_json_set(item, "key", ast_json_string_create(row->key)) ||
+        incoming_json_set(item, "seqorder", ast_json_integer_create(row->seqorder)) ||
+        incoming_json_set(item, "message", ast_json_string_create(row->message)) ||
+        incoming_json_set(item, "expiration", ast_json_integer_create(row->expiration)) ||
+        incoming_json_set(item, "delete_status", ast_json_integer_create(row->delete_status)) ||
+        incoming_json_set(item, "delete_attempts", ast_json_integer_create(row->delete_attempts)) ||
+        incoming_json_set(item, "retry_at", ast_json_integer_create(row->retry_at)) ||
+        incoming_json_set(item, "mt_queued", ast_json_boolean(row->mt_queued)) ||
+        incoming_json_set(item, "mt_mid", ast_json_string_create(row->mt_mid))) {
+        ast_json_unref(item);
+        goto failed;
+    }
+    if (ast_json_array_append(builder->items, item)) {
+        ast_json_unref(item);
+        goto failed;
+    }
+    return 0;
+failed:
+    builder->failed = 1;
+    return 1; /* pager stops; caller discards partial JSON and answers HTTP 500 */
+}
+
+/** Отправить HTTP 500 с MIME/body для выбранного HTML/JSON режима и exact byte length. */
+static void mt_web_incoming_error(int fd, int is_json)
+{
+    struct web_incoming_error response;
+    web_incoming_error_response(is_json, &response);
+    mt_web_db_error(fd, "incoming parts", response.content_type,
+                    response.body, (int)response.body_len);
+}
+
+/** Отправить тестируемый exact 404 text/plain ответ для невалидной/неизвестной SIM. */
+static void mt_web_incoming_not_found(int fd)
+{
+    struct web_incoming_error response;
+    web_incoming_not_found_response(&response);
+    mt_web_send(fd, response.status, response.content_type,
+                response.body, (int)response.body_len);
+}
+
+/** Обслужить read-only HTML/JSON страницу retained частей и pagination metadata.
+ * device NULL означает все SIM; page уже parsed, затем clamp-ится web_util_page_meta.
+ * SQL failure и JSON allocation failure дают 500, empty query остаётся успешным 200.
+ * smsdb wrappers кратко захватывают DB mutex; сокет send выполняется после SQL callback.
+ */
+static void mt_web_incoming_parts(int fd, const char *device, int page, int is_json)
+{
+    int total = 0, pages = 1, offset = 0;
+    if (smsdb_incoming_parts_count(device, &total)) {
+        mt_web_incoming_error(fd, is_json);
+        return;
+    }
+    (void)web_util_page_meta(total, MT_WEB_PAGE_SIZE, &page, &pages, &offset);
+
+    if (is_json) {
+        struct incoming_json_ctx ctx = { ast_json_array_create(), 0 };
+        struct ast_json *root;
+        char *serialized;
+        if (!ctx.items) {
+            mt_web_incoming_error(fd, 1);
+            return;
+        }
+        if (smsdb_incoming_parts_page(device, MT_WEB_PAGE_SIZE, offset, &ctx, incoming_json_row) || ctx.failed) {
+            ast_json_unref(ctx.items);
+            mt_web_incoming_error(fd, 1);
+            return;
+        }
+        root = ast_json_object_create();
+        if (!root) {
+            ast_json_unref(ctx.items);
+            mt_web_incoming_error(fd, 1);
+            return;
+        }
+        if (incoming_json_set(root, "device", device ? ast_json_string_create(device) : ast_json_null()) ||
+            incoming_json_set(root, "page", ast_json_integer_create(page)) ||
+            incoming_json_set(root, "page_size", ast_json_integer_create(MT_WEB_PAGE_SIZE)) ||
+            incoming_json_set(root, "total", ast_json_integer_create(total)) ||
+            incoming_json_set(root, "pages", ast_json_integer_create(pages)) ||
+            ast_json_object_set(root, "items", ctx.items)) {
+            ast_json_unref(ctx.items);
+            ast_json_unref(root);
+            mt_web_incoming_error(fd, 1);
+            return;
+        }
+        ctx.items = NULL; /* После успешного object_set массивом владеет root. */
+        serialized = ast_json_dump_string_format(root, AST_JSON_PRETTY);
+        if (!serialized) {
+            ast_json_unref(root);
+            mt_web_incoming_error(fd, 1);
+            return;
+        }
+        mt_web_send(fd, "200 OK", "application/json", serialized, strlen(serialized));
+        ast_json_free(serialized);
+        ast_json_unref(root);
+        return;
+    }
+
+    RAII_VAR(struct ast_str *, buf, ast_str_create(8192), ast_free);
+    RAII_VAR(struct ast_str *, url, ast_str_create(128), ast_free);
+    mt_web_html_head(&buf, "Incoming SMS parts");
+    mt_web_nav(&buf);
+    ast_str_append(&buf, 0, "<h1>Incoming SMS parts</h1><p><a href=\"");
+    if (web_incoming_page_url(ast_str_buffer(url), 128, device, page, 1) == 0)
+        mt_html_escape(&buf, ast_str_buffer(url));
+    ast_str_append(&buf, 0, "\">JSON</a> | total: %d</p>", total);
+    if (!total) {
+        ast_str_append(&buf, 0, "<p class=\"empty\">Нет накопленных частей.</p>");
+    } else {
+        struct incoming_html_ctx ctx = { &buf };
+        ast_str_append(&buf, 0, "<table><tr><th>rowid</th><th>device</th><th>storage</th><th>index</th><th>group key</th><th>seqorder</th><th>message</th><th>expiration</th><th>delete state</th><th>attempts</th><th>retry</th><th>queued</th><th>MID</th></tr>");
+        if (smsdb_incoming_parts_page(device, MT_WEB_PAGE_SIZE, offset, &ctx, incoming_html_row)) {
+            mt_web_incoming_error(fd, 0);
+            return;
+        }
+        ast_str_append(&buf, 0, "</table>");
+    }
+    ast_str_append(&buf, 0, "<p>Page %d / %d", page, pages);
+    if (page > 1 && web_incoming_page_url(ast_str_buffer(url), 128, device, page - 1, 0) == 0) {
+        ast_str_append(&buf, 0, " <a href=\"");
+        mt_html_escape(&buf, ast_str_buffer(url));
+        ast_str_append(&buf, 0, "\">Previous</a>");
+    }
+    if (page < pages && web_incoming_page_url(ast_str_buffer(url), 128, device, page + 1, 0) == 0) {
+        ast_str_append(&buf, 0, " <a href=\"");
+        mt_html_escape(&buf, ast_str_buffer(url));
+        ast_str_append(&buf, 0, "\">Next</a>");
+    }
+    ast_str_append(&buf, 0, "</p></body></html>");
+    mt_web_send(fd, "200 OK", "text/html; charset=utf-8", ast_str_buffer(buf), ast_str_strlen(buf));
+}
+
+/** Разобрать один HTTP GET, dispatch legacy handlers без изменения и новый parts route.
+ * fd принадлежит этой функции и закрывается в общем epilogue; query/path локальны.
+ * Новый classifier вызывается только для incoming route family; SIM parser/existence
+ * check предшествуют DB read, malformed/unknown device получает 404.
+ */
 static void mt_web_serve_client(int client_fd)
 {
     char req[2048];
@@ -1450,6 +1658,9 @@ static void mt_web_serve_client(int client_fd)
     ssize_t n;
     int ms  = 3000;
     int exception = 0;
+    int incoming_json = 0;
+    const char *incoming_tail = NULL;
+    enum web_incoming_route_kind incoming_route;
 
     /* read the request line with a timeout so a stuck client cannot block us */
     if (ast_waitfor_n_fd(&client_fd, 1, &ms, &exception) != client_fd) {
@@ -1484,6 +1695,7 @@ static void mt_web_serve_client(int client_fd)
         query = q + 1;
     }
 
+    incoming_route = web_incoming_route(path, &incoming_tail, &incoming_json);
     if (strcasecmp(method, "GET") != 0) {
         mt_web_send(client_fd, "405 Method Not Allowed", "text/plain", "method not allowed", 19);
     } else if (!strcmp(path, "/json")) {
@@ -1495,12 +1707,25 @@ static void mt_web_serve_client(int client_fd)
         mt_web_status_html(client_fd);
     } else if (!strcmp(path, "/sms")) {
         mt_web_sms_index_html(client_fd);
+    } else if (incoming_route != WEB_INCOMING_NOT_ROUTE) {
+        if (incoming_route == WEB_INCOMING_ALL_HTML || incoming_route == WEB_INCOMING_ALL_JSON) {
+            mt_web_incoming_parts(client_fd, NULL, mt_web_page_param(query), incoming_json);
+        } else {
+            char sim[MT_WEB_SIM_MAX];
+            int sim_json = 0;
+            if (mt_web_parse_sim_path(incoming_tail, sim, sizeof(sim), &sim_json) != 0 || !mt_web_sim_exists(sim)) {
+                mt_web_incoming_not_found(client_fd);
+            } else {
+                /* Классификатор выбирает формат ответа; SIM parser проверяет и извлекает имя устройства. */
+                mt_web_incoming_parts(client_fd, sim, mt_web_page_param(query), incoming_json);
+            }
+        }
     } else if (ast_begins_with(path, "/sms/")) {
         const int page = mt_web_page_param(query);
         char sim[MT_WEB_SIM_MAX];
         int is_json = 0;
         if (mt_web_parse_sim_path(path + (sizeof("/sms/") - 1), sim, sizeof(sim), &is_json) != 0 || !mt_web_sim_exists(sim)) {
-            /* unknown SIM or malformed path -> 404 */
+            /* Неизвестный SIM или некорректный путь: ответ 404. */
             mt_web_send(client_fd, "404 Not Found", "text/plain", "not found", 9);
         } else if (is_json) {
             mt_web_sms_json(client_fd, sim, page);

@@ -7,6 +7,7 @@
 
 #include "dc_config.h" /* DEVNAMELEN */
 #include "sms_paging.h" /* struct sms_paging_row / unified SMS history */
+#include "sms_incoming_paging.h"
 
 #define MT_MID_LEN 128
 #define MT_STATE_LEN 32
@@ -49,22 +50,41 @@ struct smsdb_mt_out_row {
 int smsdb_init();
 void smsdb_atexit();
 int smsdb_put(const char* id, const char* addr, int ref, int parts, int order, const char* msg, struct ast_str** out);
-/*! Store a SIM segment and retain it until its delivery group is queued and all source cells are confirmed empty.
- * The helper commits segment and assembly atomically under the SMS DB mutex; storage must be SM. */
+/** Сохранить segment из SIM в incoming_msg с exact SM/device/index identity.
+ * При вызове удерживает общий smsdb mutex и транзакционно сохраняет сегмент/assembly;
+ * retain lifetime продолжается до queue marker и подтверждения пустоты всех исходных ячеек.
+ * storage должен быть "SM"; out — caller-owned ast_str output либо NULL; rowid получает
+ * точный persisted row. Возвращает legacy count/result либо отрицательное значение при DB error;
+ * не выдаёт право CMGD при неуспешном commit.
+ */
 int smsdb_put_sim(const char* id, const char* addr, int ref, int parts, int order, const char* msg, const char* storage, int index, struct ast_str** out, long long* rowid);
-/*! Apply and durably commit one deletion transition for exactly rowid and its stored source identity. */
+/** Транзакционно применить один delete event к rowid и сохранённому source identity.
+ * rowid — durable row; event — sms_delete_event_t; retry_at — epoch seconds; status/attempts
+ * необязательные outputs. Mutex удерживается от state read через update/GC до COMMIT/ROLLBACK.
+ * Возвращает 0 при commit, -1 при несовпадении row/DB error.
+ */
 int smsdb_incoming_delete_apply(long long rowid, int event, int retry_at, int* status, unsigned* attempts);
-/*! Return 1 and the existing MID when this stable segment group already has a durable MT row; 0 means not yet queued.
- * Called before generating a candidate MID so a normal reread does not allocate another queue identity. */
+/** Проверить stable group marker перед созданием candidate MID.
+ * 1 означает queued и заполняет mid; 0 означает marker пока отсутствует; -1 — DB/buffer error.
+ * storage/index входят в состав key. Выходной mid buffer принадлежит caller.
+ */
 int smsdb_incoming_group_mt_mid(const char* id, const char* addr, int ref, int parts, const char* storage, int index, char* mid, size_t mid_len);
-/*! Atomically insert the MT row and durable group marker, or return the existing MID without another insert.
- * The explicit DB mutex is held across BEGIN through COMMIT/ROLLBACK. */
+/** Атомарно создать incoming MT row и group marker либо вернуть прежний MID.
+ * Кандидат MID создаётся caller-ом; effective_mid/inserted сообщают результат и принадлежат caller.
+ * Общий DB mutex удерживается от BEGIN до COMMIT/ROLLBACK, включая eligible group GC.
+ * Возвращает 0 на success, -1 на DB/commit error; после ошибки caller не ставит CMGD.
+ */
 int smsdb_mt_queue_incoming_group(const char* id, const char* addr, int ref, int parts, const char* storage, int index,
                                   const char* candidate_mid, const char* from_num, const char* message, const char* timestamp,
                                   char* effective_mid, size_t effective_mid_len, int* inserted);
-/*! Pick one due SM cell job, including ambiguous CMGD_SENT for fresh-read recovery. */
+/** Выбрать due SM job; CMGD_SENT включён для обязательной fresh-read recovery.
+ * Возвращает 1 с rowid/device/index, 0 если due jobs нет, -1 при ошибке; caller владеет outputs.
+ */
 int smsdb_incoming_delete_job(long long* rowid, char* device, size_t device_len, int* index);
-/*! Defer a temporarily non-actionable due row without changing delete status or failure count. */
+/** Сдвинуть retry_at временно недоступной/disabled SIM без изменения status/attempts.
+ * rowid должен быть точной job, retry_at задан в epoch seconds. Mutation выполняется
+ * под smsdb mutex; возвращает 0 на update/commit, -1 при DB error.
+ */
 int smsdb_incoming_delete_defer(long long rowid, int retry_at);
 int smsdb_get_refid(const char* id, const char* addr);
 int smsdb_outgoing_add(const char* id, const char* addr, const char* msg, int cnt, int ttl, int srr);
@@ -111,5 +131,12 @@ int smsdb_sms_page(const char* device, int page_size, int offset, void* ctx, sms
     \a device is NULL.
     \return 0 on success and stores the count in *total, -1 on error */
 int smsdb_sms_count(const char* device, int* total);
+/** Прочитать страницу incoming_msg под общей SMS DB mutex; см. pager контракт в заголовке.
+ * device NULL/empty означает все SIM; callback получает копию row только на время вызова.
+ * Возвращает 0 при успехе, -1 при SQL/DB error; DB не меняет.
+ */
+int smsdb_incoming_parts_page(const char* device, int page_size, int offset, void* ctx, sms_incoming_page_cb cb);
+/** Посчитать incoming_msg строки под mutex; нулевой count — корректный результат, -1 — ошибка. */
+int smsdb_incoming_parts_count(const char* device, int* total);
 
 #endif

@@ -125,12 +125,12 @@ typedef struct pvt {
     /* SMS support */
     int incoming_sms_index; /*!< CMGR index currently being fetched; -1 when idle. */
     int incoming_sms_type; /*!< Response origin used by the existing SMS acknowledgement path. */
-    long long sms_verify_rowid; /*!< Durable segment that owns the active fresh CMGL verification. */
-    int sms_verify_index; /*!< SIM index correlated to sms_verify_rowid for this scan. */
-    unsigned sms_verify_active:1; /*!< Prevent overlapping verify scans and gate target-cell matching. */
-    unsigned sms_verify_found:1; /*!< A parsed CMGL entry proved the target cell is present. */
-    int sms_db_retry_index; /*!< Volatile fallback for a SIM read not durably recorded in DB. */
-    int sms_db_retry_at; /*!< Earliest periodic reread time for sms_db_retry_index. */
+    long long sms_verify_rowid; /*!< Durable incoming_msg rowid, владелец текущей fresh CMGL проверки; 0 если scan не привязан. */
+    int sms_verify_index; /*!< SM slot, который сравнивается с sms_verify_rowid при разборе CMGL. */
+    unsigned sms_verify_active:1; /*!< Ненулевой флаг исключает параллельные scans и включает target matching. */
+    unsigned sms_verify_found:1; /*!< Ненулевой флаг означает, что CMGL показал целевую ячейку непустой. */
+    int sms_db_retry_index; /*!< Volatile SM index для повторного чтения, если первая запись в БД не состоялась. */
+    int sms_db_retry_at; /*!< Время следующего процесса retry для sms_db_retry_index, Unix epoch seconds. */
 
     struct ast_tm module_time;
 

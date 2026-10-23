@@ -184,11 +184,13 @@ static void __attribute__((format(printf, 7, 8))) at_ok_response_log(int level, 
 #define at_ok_response_wrn(pvt, ecmd, ...) at_ok_response_log(LOG_WARNING, pvt, ecmd, __VA_ARGS__)
 #define at_ok_response_notice(pvt, ecmd, ...) at_ok_response_log(LOG_NOTICE, pvt, ecmd, __VA_ARGS__)
 
+/** Запустить только свежую CMGL verification для durable row/index; старый CMGD не повторяется. */
 static int at_sms_start_verify(struct pvt* pvt, long long rowid, int index)
 {
     return at_enqueue_sms_delete_verify(&pvt->sys_chan, rowid, index);
 }
 
+/** Сохранить volatile fallback retry, если segment/save DB outcome временно неизвестен. */
 static void at_sms_defer_db_retry(struct pvt* pvt, int index)
 {
     if (!CONF_SHARED(pvt, sms_autodelete) || index < 0) {
@@ -198,6 +200,7 @@ static void at_sms_defer_db_retry(struct pvt* pvt, int index)
     pvt->sms_db_retry_at = (int)time(NULL) + CONF_GLOBAL(mt_retry_interval);
 }
 
+/** Persisted rowid/state после чего поставить CMGD для выбранного SM index. */
 static int at_sms_queue_delete(struct pvt* pvt, int index, long long rowid)
 {
     if (smsdb_incoming_delete_apply(rowid, SMS_DELETE_EVENT_DELETE_QUEUED, 0, NULL, NULL)) {
@@ -211,26 +214,28 @@ static int at_sms_queue_delete(struct pvt* pvt, int index, long long rowid)
     return 0;
 }
 
-/* Bridge parsed AT contents to the dependency-light orchestration seam. Save and
- * queue callbacks perform synchronous SQLite commits; delete_cell runs only
- * after those durable steps, while verification callbacks keep rowid identity. */
+/** Контекст связки разобранного AT сообщения с policy callbacks.
+ * pvt живёт дольше синхронного flow; входные строки/ast_str заимствованы на его время.
+ * Индекс/ref/parts/order — значения текущего PDU; verifying ссылается на активный
+ * rowid из per-device state. MID хранится inline, чтобы callbacks не передавали владение.
+ */
 typedef struct sms_flow_context {
-    struct pvt* pvt;
-    const char* sender;
-    const char* message;
-    const char* timestamp;
-    struct ast_str** fullmsg;
-    int index;
-    int ref;
-    int parts;
-    int order;
-    int verifying;
-    int mt_queue_saved;
-    int mt_queue_inserted;
-    char mid[MT_MID_LEN];
+    struct pvt* pvt; /*!< Устройство/AT очередь и текущие verification поля; caller-owned. */
+    const char* sender; /*!< Адрес источника PDU, borrowed на весь flow call. */
+    const char* message; /*!< Текст текущего сегмента; borrowed до возврата. */
+    const char* timestamp; /*!< Время SMS в текстовой форме для MT row. */
+    struct ast_str** fullmsg; /*!< Выход assembled текста; caller-owned ast_str pointer. */
+    int index; /*!< SM slot текущей части, не durable identity без rowid. */
+    int ref; /*!< Concat reference из UDH. */
+    int parts; /*!< Общее ожидаемое число частей multipart SMS. */
+    int order; /*!< Номер части в sequence assembly. */
+    int verifying; /*!< Ненулевое значение указывает fresh recovery scan path. */
+    int mt_queue_saved; /*!< Ненулевое значение: complete MT queue уже durable существует. */
+    int mt_queue_inserted; /*!< Ненулевое значение: текущий callback создал новую MT row. */
+    char mid[MT_MID_LEN]; /*!< Candidate/effective durable MID, inline buffer контекста. */
 } sms_flow_context_t;
 
-/* Commits the current segment and assembly before the flow can queue or delete it. */
+/** Flow callback: записать segment под smsdb transaction и вернуть durable rowid/assembly. */
 static int sms_flow_save_cell(void* opaque, sms_flow_result_t* result)
 {
     sms_flow_context_t* context = opaque;
@@ -246,7 +251,8 @@ static int sms_flow_save_cell(void* opaque, sms_flow_result_t* result)
     return 0;
 }
 
-/* Only called for a complete assembly; MT insertion and group marker must be durable before CMGD. */
+/* Только для полной сборки: MT row и group marker должны быть durable до CMGD. */
+/** Flow callback: атомарно обеспечить полную MT row и stable group MID marker. */
 static int sms_flow_queue_complete(void* opaque, const sms_flow_result_t* result)
 {
     sms_flow_context_t* context = opaque;
@@ -255,7 +261,7 @@ static int sms_flow_queue_complete(void* opaque, const sms_flow_result_t* result
                                                       "SM", context->index, context->mid, sizeof(context->mid));
     if (already_queued < 0) return -1;
     if (already_queued) {
-        /* Reuse the durable marker (including legacy markers without a stored MID); do not generate a new queue identity. */
+        /* Переиспользовать durable marker, включая legacy marker без MID; новую queue identity не создавать. */
         context->mt_queue_saved = 1;
         return 0;
     }
@@ -272,7 +278,8 @@ static int sms_flow_queue_complete(void* opaque, const sms_flow_result_t* result
     return 0;
 }
 
-/* Persist the next state first; a stopped row is deliberately not given another CMGD. */
+/* Сначала сохранить следующее состояние; STOPPED запись намеренно не получает новый CMGD. */
+/** Flow callback: сохранить delete state и поставить exact row-correlated CMGD. */
 static int sms_flow_delete_cell(void* opaque, const sms_flow_result_t* result)
 {
     sms_flow_context_t* context = opaque;
@@ -284,14 +291,16 @@ static int sms_flow_delete_cell(void* opaque, const sms_flow_result_t* result)
     return at_sms_queue_delete(context->pvt, context->index, result->durable_rowid);
 }
 
-/* A successful fresh SM listing with no target entry is durable deletion proof. */
+/* Успешный свежий список SM без целевой ячейки является durable подтверждением удаления. */
+/** Flow callback для fresh absent: durably complete отметить row и проверить GC eligibility. */
 static int sms_flow_mark_absent(void* opaque)
 {
     sms_flow_context_t* context = opaque;
     return smsdb_incoming_delete_apply(context->pvt->sms_verify_rowid, SMS_DELETE_EVENT_VERIFY_ABSENT, 0, NULL, NULL);
 }
 
-/* DB/read failures defer without incrementing confirmed CMGD failures. */
+/* DB/read errors откладываются и не увеличивают число подтверждённых CMGD failures. */
+/** Flow callback для DB/read failure: назначить retry без изменения attempts. */
 static void sms_flow_defer_retry(void* opaque)
 {
     sms_flow_context_t* context = opaque;
@@ -303,6 +312,13 @@ static void sms_flow_defer_retry(void* opaque)
     }
 }
 
+/** Обработать успешный AT ответ, включая rowid-correlated CMGD commit.
+ * pvt/task/ecmd принадлежат serialized AT pipeline и живут до завершения handler;
+ * для CMGD DB transition выполняется после modem OK. Если persist не удался,
+ * CMGD_SENT оставляют due для restart picker, который делает fresh CMGL, не replay.
+ * Возвращаемый int — прежний response dispatch contract; SQLite mutex освобождается
+ * внутри smsdb API до дальнейшей обработки ответа.
+ */
 static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at_queue_task_t* const task, const at_queue_cmd_t* const ecmd)
 {
     if (!ecmd) {
@@ -550,8 +566,8 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
 
         case CMD_AT_CMGD:
             at_ok_response_dbg(3, pvt, ecmd, "Message deleted successfully");
-            /* If this state COMMIT fails, CMGD_SENT remains due; the picker
-             * includes it and restart recovery confirms the cell with fresh CMGL. */
+            /* Если этот state COMMIT не прошёл, CMGD_SENT остаётся due;
+             * picker выбирает его и restart recovery проверяет ячейку свежим CMGL. */
             if (task->sms_delete_rowid > 0 && smsdb_incoming_delete_apply(task->sms_delete_rowid, SMS_DELETE_EVENT_CMGD_OK, 0, NULL, NULL)) {
                 ast_log(LOG_ERROR, "[%s][SMS:%d] Could not persist confirmed SIM deletion\n", PVT_ID(pvt), task->uid);
             }
@@ -728,6 +744,12 @@ static void __attribute__((format(printf, 7, 8))) at_err_response_log(int level,
  * \retval -1 error
  */
 
+/** Обработать AT ERROR/TIMEOUT и сохранить uncertain CMGD до новой проверки.
+ * task несёт durable rowid, ecmd идентифицирует текущую команду; владение ими
+ * остаётся AT queue. Старый CMGD не повторяется: handler durable переводит state
+ * и ставит свежую SIM verification; временный DB/read failure только переносит retry.
+ * Возвращает прежний результат общего response dispatch, не держит DB lock вокруг AT enqueue.
+ */
 static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const at_queue_task_t* const task, const at_queue_cmd_t* const ecmd)
 {
     if (!ecmd) {
@@ -945,8 +967,8 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
         case CMD_AT_CMGD:
             at_err_response_err(pvt, ecmd, "Error deleting message");
             if (task->sms_delete_rowid > 0) {
-                /* Persist the failed/uncertain CMGD before queueing a fresh read;
-                 * the next durable present result is the only event that counts it. */
+                /* Сохранить failure/uncertain CMGD до свежего чтения;
+                 * только следующий durable present result может увеличить счётчик. */
                 smsdb_incoming_delete_apply(task->sms_delete_rowid, at_res == RES_TIMEOUT ? SMS_DELETE_EVENT_CMGD_TIMEOUT : SMS_DELETE_EVENT_CMGD_ERROR,
                                             (int)time(NULL), NULL, NULL);
                 if (at_sms_start_verify(pvt, task->sms_delete_rowid, task->uid)) {
@@ -1703,6 +1725,7 @@ static int at_response_cmgs_error(struct pvt* const pvt, const at_queue_task_t* 
  * \retval -1 error
  */
 
+/** Обработать +CMTI: сохранить storage/index correlation и прочитать только supported SM. */
 static int at_response_cmti(struct pvt* const pvt, const struct ast_str* const response)
 {
     int idx;
@@ -1740,6 +1763,7 @@ static int at_response_cmti(struct pvt* const pvt, const struct ast_str* const r
  * \retval -1 error
  */
 
+/** Обработать status-report indication отдельно от обычного incoming SIM segment. */
 static int at_response_cdsi(struct pvt* const pvt, const struct ast_str* const response)
 {
     int idx;
@@ -1776,6 +1800,7 @@ static int at_response_cdsi(struct pvt* const pvt, const struct ast_str* const r
  * \retval -1 error
  */
 
+/** Разобрать CMGR/CMGL/RES_CMT и выполнить save→queue→delete policy через flow callbacks. */
 static int at_response_msg(struct pvt* const pvt, const struct ast_str* const response, at_res_t cmd)
 {
     static const ssize_t MSG_DEF_LEN = 64;
@@ -1840,7 +1865,7 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
         ast_log(LOG_WARNING, "[%s] Error parsing incoming message: %s\n", PVT_ID(pvt), error2str(chan_quectel_err));
         msg_ack = TRIBOOL_FALSE;
         if (verify_scan) {
-            pvt->sms_verify_found = 1; /* An unparseable listing cannot prove the target cell is absent. */
+            pvt->sms_verify_found = 1; /* Неразбираемый список не доказывает пустоту целевой ячейки. */
             smsdb_incoming_delete_apply(pvt->sms_verify_rowid, SMS_DELETE_EVENT_VERIFY_READ_ERROR,
                                         (int)time(NULL) + CONF_GLOBAL(mt_retry_interval), NULL, NULL);
         } else if ((cmd == RES_CMGR || cmd == RES_CMGL) && CONF_SHARED(pvt, sms_autodelete)) {
@@ -1990,7 +2015,7 @@ static int at_response_msg(struct pvt* const pvt, const struct ast_str* const re
                          ast_str_buffer(oa));
             }
 
-            /* MT delivery: queue before starting the Local channel. SIM-backed flow queued it before CMGD. */
+            /* MT delivery: queue перед Local channel; SIM-backed flow уже поставил очередь до CMGD. */
             if (!persist_sim_part) {
                 mt_gen_mid(PVT_ID(pvt), mid, sizeof(mid));
                 if (smsdb_mt_put(PVT_ID(pvt), mid, ast_str_buffer(oa), ast_str_buffer(fullmsg), ast_str_buffer(scts_str))) {

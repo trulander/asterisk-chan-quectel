@@ -1,8 +1,7 @@
-# Unit tests for the pure (non-Asterisk) helper modules. Each test compiles
-# the production source it covers directly, so nothing production-side depends
-# on test-only code. CTest is enabled from the top-level CMakeLists.
+# Unit tests для helper-модулей без Asterisk. Каждый target компилирует production source,
+# который покрывает тест; production код не зависит от тестовых файлов. CTest включён корневым CMakeLists.
 
-# web_util: RSSI bars / int parsing / page clamping / pagination / query params
+# web_util: RSSI bars, строгий integer parsing, clamping страниц, pagination и query parameters.
 add_executable(ctq_web_util_test
     web_util_test.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/web_util.c
@@ -11,8 +10,7 @@ target_include_directories(ctq_web_util_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_compile_options(ctq_web_util_test PRIVATE -Wall -Wextra)
 add_test(NAME web-util COMMAND ctq_web_util_test)
 
-# sms_paging: unified SMS history pagination (MT+MO merge, per-SIM filter,
-# newest-first order, count metadata) against a real in-memory SQLite DB.
+# sms_paging: unified MT+MO history, per-SIM filter, newest-first order и count на настоящей in-memory SQLite.
 add_executable(ctq_sms_paging_test
     sms_paging_test.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_paging.c
@@ -22,8 +20,27 @@ target_link_libraries(ctq_sms_paging_test PRIVATE SQLite::SQLite3)
 target_compile_options(ctq_sms_paging_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-paging COMMAND ctq_sms_paging_test)
 
-# sms_multipart: the same production SQLite helper used by smsdb_put(), with
-# actual out-of-order assembly and queue insertion against an in-memory DB.
+# incoming_msg pager: production SQL на настоящей SQLite, filter/order/page/errors/no-mutation.
+add_executable(ctq_sms_incoming_paging_test
+    sms_incoming_paging_test.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_incoming_paging.c
+)
+target_include_directories(ctq_sms_incoming_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_sms_incoming_paging_test PRIVATE SQLite::SQLite3)
+target_compile_options(ctq_sms_incoming_paging_test PRIVATE -Wall -Wextra)
+add_test(NAME sms-incoming-paging COMMAND ctq_sms_incoming_paging_test)
+
+# Контрактные incoming-parts helpers, которые напрямую вызываются mt_task.c: route/escaping/errors/URL.
+add_executable(ctq_web_incoming_parts_test
+    web_incoming_parts_test.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/web_incoming_parts.c
+)
+target_include_directories(ctq_web_incoming_parts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_options(ctq_web_incoming_parts_test PRIVATE -Wall -Wextra)
+add_test(NAME web-incoming-parts COMMAND ctq_web_incoming_parts_test)
+
+# sms_multipart: production SQLite helper из smsdb_put(); out-of-order assembly/queue на in-memory DB.
+# Multipart/schema regression: migration, rowid/source identity, 1,3,2 assembly и COMMIT failure.
 add_executable(ctq_sms_multipart_test
     sms_multipart_test.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_multipart.c
@@ -35,7 +52,8 @@ target_link_libraries(ctq_sms_multipart_test PRIVATE SQLite::SQLite3 Threads::Th
 target_compile_options(ctq_sms_multipart_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-multipart COMMAND ctq_sms_multipart_test)
 
-# sms_delete_state: production-used deletion/retry state transitions.
+# sms_delete_state: production state transitions удаления/retry, включая лимит и recovery.
+# Таблица persisted state transitions, recovery и лимит подтверждённых ошибок CMGD.
 add_executable(ctq_sms_delete_state_test
     sms_delete_state_test.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_delete_state.c
@@ -44,7 +62,7 @@ target_include_directories(ctq_sms_delete_state_test PRIVATE ${CMAKE_CURRENT_SOU
 target_compile_options(ctq_sms_delete_state_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-delete-state COMMAND ctq_sms_delete_state_test)
 
-# sms_delete_flow: production orchestration of read/save/queue/delete policy.
+# sms_delete_flow: production policy порядка read/save/queue/delete на callbacks.
 add_executable(ctq_sms_delete_flow_test
     sms_delete_flow_test.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_delete_flow.c
@@ -54,8 +72,7 @@ target_include_directories(ctq_sms_delete_flow_test PRIVATE ${CMAKE_CURRENT_SOUR
 target_compile_options(ctq_sms_delete_flow_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-delete-flow COMMAND ctq_sms_delete_flow_test)
 
-# End-to-end deletion flow with production SQLite schema, multipart helpers,
-# durable queue markers, restart picker, and confirmed-absence group GC.
+# SQLite-backed deletion flow: production schema/helpers, queue marker, restart picker и confirmed-absence GC.
 add_executable(ctq_sms_delete_flow_sqlite_test
     sms_delete_flow_sqlite_test.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_delete_flow.c
@@ -69,11 +86,9 @@ target_link_libraries(ctq_sms_delete_flow_sqlite_test PRIVATE SQLite::SQLite3 Th
 target_compile_options(ctq_sms_delete_flow_sqlite_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-delete-flow-sqlite COMMAND ctq_sms_delete_flow_sqlite_test)
 
-# sms_tx: dependency-free SQLite transaction primitives (src/sms_tx.[ch]).
-# Exercises the nested-BEGIN fix directly against an in-memory database:
-# concurrent begin/commit on one connection, failed COMMIT -> ROLLBACK (no
-# half-open connection), failed BEGIN, COMMIT contention/SQLITE_BUSY -> no
-# leak, multipart out-of-order/duplicate seqorder, and SRR-NULL rendering.
+# sms_tx: независимые SQLite transaction primitives src/sms_tx.[ch]. Проверяются nested-BEGIN,
+# параллельные begin/commit одного connection, failed COMMIT→ROLLBACK, failed BEGIN,
+# SQLITE_BUSY без утечки transaction, повтор seqorder и NULL SRR mapping.
 add_executable(ctq_sms_tx_test
     sms_tx_test.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_tx.c

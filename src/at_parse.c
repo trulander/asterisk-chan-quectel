@@ -407,6 +407,9 @@ int at_parse_creg(char* str, int cereg, int* gsm_reg_status, char** lac, char** 
     return 0;
 }
 
+/** Разобрать unsolicited +CMTI: storage сохраняется целиком, индекс проверяется как число.
+ * Ошибка/обрезка буфера возвращает отрицательное значение и не должна планировать CMGR.
+ */
 int at_parse_cmti(const char* str, char* storage, size_t storage_len, int* idx)
 {
     /* Parse +CMTI: <mem>,<index>; retain the memory name for safe CMGR/CMGD. */
