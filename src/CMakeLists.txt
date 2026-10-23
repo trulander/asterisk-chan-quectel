@@ -38,6 +38,7 @@ set(SRC_FILES
     sms_tx.c
     # Журнал вызовов и атомарная постановка missed уведомлений в существующую MT очередь.
     call_log.c
+    call_paging.c
     tty.c
     web_util.c
     # Чистые route/escaping/response helpers, используемые production и CTest.

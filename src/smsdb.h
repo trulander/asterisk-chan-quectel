@@ -7,6 +7,7 @@
 
 #include "dc_config.h" /* DEVNAMELEN */
 #include "call_log.h"
+#include "call_paging.h"
 #include "sms_paging.h" /* struct sms_paging_row / unified SMS history */
 #include "sms_incoming_paging.h"
 #include "sim_metrics.h"
@@ -149,6 +150,9 @@ int smsdb_sms_page(const char* device, int page_size, int offset, void* ctx, sms
     \a device is NULL.
     \return 0 on success and stores the count in *total, -1 on error */
 int smsdb_sms_count(const char* device, int* total);
+/** Читать durable call_log страницу/total под mutex общего SQLite connection; ошибки возвращают -1. */
+int smsdb_call_page(const char* device, int limit, int offset, void* ctx, call_page_cb cb);
+int smsdb_call_count(const char* device, int* total);
 /** Прочитать per-SIM home-card счётчики под mutex общего SQLite connection.
  * Ошибка любой требуемой таблицы/SQL возвращает -1; успешный нулевой результат остаётся нулём.
  */

@@ -1655,6 +1655,19 @@ int smsdb_sms_count(const char* device, int* total)
     return res;
 }
 
+/** Сериализовать вызовы pager/count журнала; callback выполняется под DB mutex, сеть вызывающий не делает в callback. */
+int smsdb_call_page(const char* device, int limit, int offset, void* ctx, call_page_cb cb)
+{
+    SCOPED_DB(smsdb);
+    return call_paging_page(smsdb, device, limit, offset, ctx, cb);
+}
+
+int smsdb_call_count(const char* device, int* total)
+{
+    SCOPED_DB(smsdb);
+    return call_paging_count(smsdb, device, total);
+}
+
 /** Считать метрики главной страницы под одним захватом общего DB mutex.
  * SQL-модуль не закрывает connection; при любой ошибке возвращается -1 и пишется причина SQLite.
  */

@@ -98,6 +98,13 @@ target_link_libraries(ctq_call_log_test PRIVATE SQLite::SQLite3)
 target_compile_options(ctq_call_log_test PRIVATE -Wall -Wextra)
 add_test(NAME call-log COMMAND ctq_call_log_test)
 
+# Call history production SQL pager: exact SIM, durable payload/order/pagination/error на in-memory SQLite.
+add_executable(ctq_call_paging_test call_paging_test.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_paging.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_log.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_multipart.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/web_util.c)
+target_include_directories(ctq_call_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_call_paging_test PRIVATE SQLite::SQLite3)
+target_compile_options(ctq_call_paging_test PRIVATE -Wall -Wextra)
+add_test(NAME call-paging COMMAND ctq_call_paging_test)
+
 # Строгий production CLCC parser и связанный snapshot-invalid/retry/finish flow на SQLite.
 add_executable(ctq_clcc_parser_test
     clcc_parser_test.c

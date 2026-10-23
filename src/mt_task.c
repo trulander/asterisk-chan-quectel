@@ -698,6 +698,7 @@ static void* mt_retry_threadproc(void* arg)
 // ================================================================
 
 #define MT_WEB_PAGE_SIZE 10 /*!< SMS rows shown per page */
+#define MT_WEB_CALL_PAGE_SIZE 30 /*!< Строгий лимит строк журнала вызовов на страницу. */
 
 /*! Max length of the /sms/<sim> device-name tail we accept (device ids are
  * DEVNAMELEN=31 in practice; keep a little headroom). */
@@ -1035,7 +1036,9 @@ static int mt_html_status_cb(void* ctx, const struct pvt_status_snapshot* snap)
     mt_html_escape(buf, snap->state);
     ast_str_append(buf, 0, "</span> <a class=\"small\" href=\"/sms/");
     mt_web_url_escape(buf, snap->name);
-    ast_str_append(buf, 0, "\">SMS history</a></h3><table class=\"kv\">");
+    ast_str_append(buf, 0, "\">SMS history</a> | <a class=\"small\" href=\"/calls/");
+    mt_web_url_escape(buf, snap->name);
+    ast_str_append(buf, 0, "\">Call history</a></h3><table class=\"kv\">");
 
     ast_str_append(buf, 0, "<tr><th>Link</th><td>");
     if (!snap->connected) {
@@ -1665,6 +1668,135 @@ static void mt_web_incoming_parts(int fd, const char *device, int page, int is_j
     mt_web_send(fd, "200 OK", "text/html; charset=utf-8", ast_str_buffer(buf), ast_str_strlen(buf));
 }
 
+/* Контекст принадлежит одному запросу; HTML либо массив JSON живут до завершения рендера. */
+struct call_render_ctx {
+    struct ast_str **html; /*!< Буфер HTML; NULL для JSON callback. */
+    struct ast_json *items; /*!< Caller-owned массив; callback передаёт ему владение элементом. */
+    int failed; /*!< Sticky flag ошибки создания/добавления JSON, чтобы отбросить partial response. */
+};
+
+/** Установить созданное значение, учитывая transfer ownership API Asterisk JSON.
+ * value при непустом входе передаётся object_set и им поглощается даже при ошибке;
+ * NULL до вызова считается ошибкой без передачи владения.
+ */
+static int mt_call_json_set(struct ast_json *object, const char *key, struct ast_json *value)
+{
+    if (!value) return -1;
+    return ast_json_object_set(object, key, value) == 0 ? 0 : -1;
+}
+
+/** Добавить durable call row в JSON массив.
+ * Все значения checked до установки; object/array set steal reference даже при ошибке,
+ * поэтому cleanup освобождает только ещё локально принадлежащий объект. Callback работает под DB mutex.
+ */
+static int mt_call_json_row(void *opaque, const struct call_page_row *row)
+{
+    struct call_render_ctx *ctx = opaque;
+    struct ast_json *item = ast_json_object_create();
+    char id[CALL_LOG_ID_LEN];
+    int failed = 0;
+    if (!item) { ctx->failed = 1; return 1; }
+    snprintf(id, sizeof(id), "call-%lld", row->id);
+    failed |= mt_call_json_set(item, "id", ast_json_string_create(id));
+    failed |= mt_call_json_set(item, "device", ast_json_string_create(row->device));
+    failed |= mt_call_json_set(item, "number", ast_json_string_create(row->number));
+    failed |= mt_call_json_set(item, "started_at", ast_json_string_create(row->started_at));
+    failed |= mt_call_json_set(item, "direction", ast_json_string_create(row->direction));
+    failed |= mt_call_json_set(item, "answered", ast_json_boolean(row->answered));
+    failed |= mt_call_json_set(item, "finished", ast_json_boolean(row->finished));
+    failed |= mt_call_json_set(item, "ended_at", ast_strlen_zero(row->ended_at) ? ast_json_null() : ast_json_string_create(row->ended_at));
+    if (!failed) {
+        /* Pass an extra reference: append consumes it on either result; local item remains ours. */
+        if (ast_json_array_append(ctx->items, ast_json_ref(item)) == 0) {
+            ast_json_unref(item);
+            return 0;
+        }
+    }
+    ast_json_unref(item);
+    ctx->failed = 1;
+    return 1;
+}
+
+/** Render one persisted row to HTML, HTML-escaping every DB-originated cell.
+ * The SIM identifier is route-validated to [A-Za-z0-9_.-] before it is used in path links.
+ */
+static int mt_call_html_row(void *opaque, const struct call_page_row *row)
+{
+    struct call_render_ctx *ctx = opaque;
+    struct ast_str **buf = ctx->html;
+    char id[CALL_LOG_ID_LEN];
+    snprintf(id, sizeof(id), "call-%lld", row->id);
+    ast_str_append(buf, 0, "<tr><td>"); mt_html_escape(buf, id);
+    ast_str_append(buf, 0, "</td><td>"); mt_html_escape(buf, row->number);
+    ast_str_append(buf, 0, "</td><td>"); mt_html_escape(buf, row->started_at);
+    ast_str_append(buf, 0, "</td><td>"); mt_html_escape(buf, row->direction);
+    ast_str_append(buf, 0, "</td><td>%s</td><td>%s</td><td>", row->answered ? "yes" : "no", row->finished ? "yes" : "no");
+    if (!ast_strlen_zero(row->ended_at)) mt_html_escape(buf, row->ended_at); else ast_str_append(buf, 0, "&mdash;");
+    ast_str_append(buf, 0, "</td></tr>");
+    return 0;
+}
+
+/** Serve one per-SIM page. Count/page share SMSDB locking; all DB/JSON allocation errors return 500.
+ * Empty histories still use page 1/1; requested page is clamped by web_util_page_meta.
+ */
+static void mt_web_calls(int fd, const char *sim, int page, int json)
+{
+    int total = 0, pages = 1, offset = 0;
+    if (smsdb_call_count(sim, &total) || web_util_page_meta(total, MT_WEB_CALL_PAGE_SIZE, &page, &pages, &offset)) {
+        if (json) mt_web_db_error(fd, "Call history count", "application/json", CALL_WEB_JSON_ERROR, sizeof(CALL_WEB_JSON_ERROR) - 1);
+        else mt_web_db_error(fd, "Call history count", "text/plain", "call database unavailable", sizeof("call database unavailable") - 1);
+        return;
+    }
+    if (json) {
+        struct call_render_ctx ctx = { NULL, ast_json_array_create(), 0 };
+        struct ast_json *root = NULL;
+        char *serialized = NULL;
+        int failed = 0;
+        if (!ctx.items || smsdb_call_page(sim, MT_WEB_CALL_PAGE_SIZE, offset, &ctx, mt_call_json_row) || ctx.failed) failed = 1;
+        if (!failed) {
+            root = ast_json_object_create();
+            if (!root) failed = 1;
+        }
+        if (!failed) {
+            failed |= mt_call_json_set(root, "device", ast_json_string_create(sim));
+            failed |= mt_call_json_set(root, "page", ast_json_integer_create(page));
+            failed |= mt_call_json_set(root, "page_size", ast_json_integer_create(MT_WEB_CALL_PAGE_SIZE));
+            failed |= mt_call_json_set(root, "total", ast_json_integer_create(total));
+            failed |= mt_call_json_set(root, "pages", ast_json_integer_create(pages));
+            /* Pass a ref because object_set steals it even on error; ctx retains cleanup ownership. */
+            failed |= mt_call_json_set(root, "items", ast_json_ref(ctx.items));
+        }
+        if (!failed) {
+            serialized = ast_json_dump_string_format(root, AST_JSON_PRETTY);
+            if (!serialized) failed = 1;
+        }
+        if (failed) mt_web_db_error(fd, "Call history JSON", "application/json", CALL_WEB_JSON_ERROR, sizeof(CALL_WEB_JSON_ERROR) - 1);
+        else mt_web_send(fd, "200 OK", "application/json", serialized, strlen(serialized));
+        ast_json_free(serialized);
+        if (ctx.items) ast_json_unref(ctx.items);
+        if (root) ast_json_unref(root);
+        return;
+    }
+
+    RAII_VAR(struct ast_str *, buf, ast_str_create(8192), ast_free);
+    char base[128];
+    if (!buf) { mt_web_db_error(fd, "Call history HTML", "text/plain", "internal error", sizeof("internal error") - 1); return; }
+    snprintf(base, sizeof(base), "/calls/%s", sim);
+    mt_web_html_head(&buf, "Call history"); mt_web_nav(&buf);
+    ast_str_append(&buf, 0, "<h1>Call history for SIM "); mt_html_escape(&buf, sim);
+    ast_str_append(&buf, 0, "</h1><p><a href=\""); mt_html_escape(&buf, base);
+    ast_str_append(&buf, 0, ".json?page=%d\">JSON</a></p><table><tr><th>ID</th><th>Number</th><th>Started (UTC)</th><th>Direction/type</th><th>Answered</th><th>Finished</th><th>Ended at (UTC)</th></tr>", page);
+    struct call_render_ctx ctx = { &buf, NULL, 0 };
+    if (smsdb_call_page(sim, MT_WEB_CALL_PAGE_SIZE, offset, &ctx, mt_call_html_row)) {
+        mt_web_db_error(fd, "Call history read", "text/plain", "call database unavailable", sizeof("call database unavailable") - 1); return;
+    }
+    ast_str_append(&buf, 0, "</table><p>Page %d / %d", page, pages);
+    if (page > 1) ast_str_append(&buf, 0, " <a href=\"%s?page=%d\">Previous</a>", base, page - 1);
+    if (page < pages) ast_str_append(&buf, 0, " <a href=\"%s?page=%d\">Next</a>", base, page + 1);
+    ast_str_append(&buf, 0, "</p></body></html>");
+    mt_web_send(fd, "200 OK", "text/html; charset=utf-8", ast_str_buffer(buf), ast_str_strlen(buf));
+}
+
 /** Разобрать один HTTP GET, dispatch legacy handlers без изменения и новый parts route.
  * fd принадлежит этой функции и закрывается в общем epilogue; query/path локальны.
  * Новый classifier вызывается только для incoming route family; SIM parser/existence
@@ -1740,6 +1872,14 @@ static void mt_web_serve_client(int client_fd)
                 /* Классификатор выбирает формат ответа; SIM parser проверяет и извлекает имя устройства. */
                 mt_web_incoming_parts(client_fd, sim, mt_web_page_param(query), incoming_json);
             }
+        }
+    } else if (ast_begins_with(path, "/calls/")) {
+        char sim[MT_WEB_SIM_MAX]; int is_json = 0;
+        int page = mt_web_page_param(query);
+        if (mt_web_parse_sim_path(path + 7, sim, sizeof(sim), &is_json) != 0 || !mt_web_sim_exists(sim)) {
+            mt_web_send(client_fd, "404 Not Found", "text/plain", "not found", 9);
+        } else {
+            mt_web_calls(client_fd,sim,page,is_json);
         }
     } else if (ast_begins_with(path, "/sms/")) {
         const int page = mt_web_page_param(query);
