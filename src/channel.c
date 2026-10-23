@@ -33,6 +33,7 @@
 #include "at_read.h"
 #include "chan_quectel.h"
 #include "helpers.h" /* get_at_clir_value()  */
+#include "smsdb.h"
 
 #ifndef ESTRPIPE
 #define ESTRPIPE EPIPE
@@ -216,6 +217,10 @@ static int get_at_clir_value(const int clir)
     return res;
 }
 
+/** Начать исходящий GSM-вызов после проверки канала и устройства.
+ * Сначала пытается сохранить журнал и продолжает исходное поведение набора при
+ * ошибке БД; cpvt владеет ID до окончательного hangup, call_idx пока неизвестен.
+ */
 static int channel_call(struct ast_channel* channel, const char* dest, attribute_unused int timeout)
 {
     struct cpvt* const cpvt = ast_channel_tech_pvt(channel);
@@ -267,7 +272,12 @@ static int channel_call(struct ast_channel* channel, const char* dest, attribute
     }
 
     PVT_STAT(pvt, out_calls)++;
+    if (smsdb_call_start(PVT_ID(pvt), -1, CALL_LOG_OUTGOING, dest_num, cpvt->call_log_id, sizeof(cpvt->call_log_id))) {
+        ast_log(LOG_ERROR, "[%s] Cannot persist outgoing call; continuing dial attempt\n", PVT_ID(pvt));
+        cpvt->call_log_id[0] = '\0';
+    }
     if (at_enqueue_dial(cpvt, dest_num, clir)) {
+        if (cpvt->call_log_id[0]) smsdb_call_finish(cpvt->call_log_id, 0);
         ast_log(LOG_ERROR, "[%s] Error sending ATD command\n", PVT_ID(pvt));
         return -1;
     }
@@ -275,8 +285,10 @@ static int channel_call(struct ast_channel* channel, const char* dest, attribute
     return 0;
 }
 
-#/* we has 2 case of call this function, when local side want terminate call and when called for cleanup after remote side alreay terminate call, CEND received and cpvt destroyed */
-
+/* Этот callback вызывается и при тайм-ауте приложения, и после удалённого отбоя.
+ * Завершение по call_log_id идемпотентно; исходящий остаётся исходящим, а
+ * незавершённый неотвеченный входящий получает атомарное missed-уведомление.
+ */
 static int channel_hangup(struct ast_channel* channel)
 {
     struct cpvt* const cpvt = ast_channel_tech_pvt(channel);
@@ -289,6 +301,9 @@ static int channel_hangup(struct ast_channel* channel)
 
         const int need_hangup  = CPVT_TEST_FLAG(cpvt, CALL_FLAG_NEED_HANGUP) ? 1 : 0;
         const int hangup_cause = ast_channel_hangupcause(channel);
+        if (cpvt->call_log_id[0] && smsdb_call_finish(cpvt->call_log_id, 0)) {
+            ast_log(LOG_ERROR, "[%s] Cannot persist call hangup idx:%d\n", PVT_ID(pvt), cpvt->call_idx);
+        }
 
         ast_debug(1, "[%s] Hanging up call - idx:%d cause:%d needed:%d\n", PVT_ID(pvt), cpvt->call_idx, hangup_cause, need_hangup);
 

@@ -131,6 +131,16 @@ typedef struct pvt {
     unsigned sms_verify_found:1; /*!< Ненулевой флаг означает, что CMGL показал целевую ячейку непустой. */
     int sms_db_retry_index; /*!< Volatile SM index для повторного чтения, если первая запись в БД не состоялась. */
     int sms_db_retry_at; /*!< Время следующего процесса retry для sms_db_retry_index, Unix epoch seconds. */
+    struct {
+        char call_id[64]; /*!< Устойчивый ID кандидата на завершение, не modem index. */
+        char successor_id[64]; /*!< Новое поколение от unsolicited incoming до свежего snapshot. */
+        int call_idx; /*!< Временный индекс для сопоставления с актуальным CLCC snapshot. */
+        unsigned int active; /*!< Кандидат ожидает завершения свежей CLCC-проверки. */
+        unsigned int seen; /*!< Текущий CLCC snapshot содержит занятый индекс. */
+        unsigned int verification_queued; /*!< Запрос свежего snapshot принят AT queue. */
+        unsigned int skip_clcc; /*!< Число уже поставленных CLCC ответов, которые старше кандидата. */
+    } call_release[32]; /*!< Ограниченные modem call slots; все поля защищены pvt->lock. */
+    unsigned int call_release_snapshot_invalid : 1; /*!< Текущий CLCC payload повреждён и не подтверждает отсутствие вызова. */
 
     struct ast_tm module_time;
 

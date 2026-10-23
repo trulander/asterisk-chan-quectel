@@ -22,6 +22,7 @@
 #include "memmem.h"
 #include "mutils.h" /* ARRAY_LEN() */
 #include "pdu.h"    /* pdu_parse() */
+#include "clcc_parser.h"
 
 #/* */
 
@@ -1080,39 +1081,10 @@ int at_parse_dsci(char* str, unsigned* call_idx, unsigned* dir, unsigned* state,
 
 #/* */
 
+/** Совместимый интерфейс CLCC parser; строгая проверка выполняется shared production helper. */
 int at_parse_clcc(char* str, unsigned* call_idx, unsigned* dir, unsigned* state, unsigned* mode, unsigned* mpty, char** number, unsigned* toa)
 {
-    /*
-     * +CLCC:<id1>,<dir>,<stat>,<mode>,<mpty>[,<number>,<type>[,<alpha>[,<priority>]]]\r\n
-     *  ...
-     * +CLCC:<id1>,<dir>,<stat>,<mode>,<mpty>[,<number>,<type>[,<alpha>[,<priority>]]]\r\n
-     *  examples
-     *   +CLCC: 1,1,4,0,0,"",145
-     *   +CLCC: 1,1,4,0,0,"+79139131234",145
-     *   +CLCC: 1,1,4,0,0,"0079139131234",145
-     *   +CLCC: 1,1,4,0,0,"+7913913ABCA",145
-     */
-    static const char delimiters[] = ":,,,,,,";
-    char* marks[STRLEN(delimiters)];
-
-    if (mark_line(str, delimiters, marks) == ARRAY_LEN(marks)) {
-        if (sscanf(marks[0] + 1, "%u", call_idx) == 1 && sscanf(marks[1] + 1, "%u", dir) == 1 && sscanf(marks[2] + 1, "%u", state) == 1 &&
-            sscanf(marks[3] + 1, "%u", mode) == 1 && sscanf(marks[4] + 1, "%u", mpty) == 1 && sscanf(marks[6] + 1, "%u", toa) == 1) {
-            marks[5]++;
-            if (marks[5][0] == '"') {
-                marks[5]++;
-            }
-            if (marks[6][-1] == '"') {
-                marks[6]--;
-            }
-            *number     = marks[5];
-            marks[6][0] = '\000';
-
-            return 0;
-        }
-    }
-
-    return -1;
+    return clcc_parse_line(str, call_idx, dir, state, mode, mpty, number, toa);
 }
 
 #/* */

@@ -6,6 +6,7 @@ set(SRC_FILES
     app.c
     at_command.c
     at_parse.c
+    clcc_parser.c
     at_queue.c
     at_read.c
     at_response.c
@@ -35,6 +36,8 @@ set(SRC_FILES
     # Независимый от Asterisk pager для страницы сохранённых входящих сегментов.
     sms_incoming_paging.c
     sms_tx.c
+    # Журнал вызовов и атомарная постановка missed уведомлений в существующую MT очередь.
+    call_log.c
     tty.c
     web_util.c
     # Чистые route/escaping/response helpers, используемые production и CTest.

@@ -62,7 +62,8 @@ typedef struct cpvt {
     struct ast_channel* channel; /*!< Channel pointer */
     struct pvt* pvt;             /*!< pointer to device structure */
 
-    short call_idx; /*!< device call ID */
+    short call_idx; /*!< текущий modem index; может повторно использоваться и не является постоянным ID */
+    char call_log_id[64]; /*!< вечный ID строки call_log, живёт вместе с cpvt и не зависит от call_idx */
 #define MIN_CALL_IDX 0
 #define MAX_CALL_IDX 31
 

@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ast_config.h"
@@ -31,6 +32,7 @@
 #include "smsdb.h"
 
 #include "sms_tx.h"
+#include "call_log.h"
 #include "sms_delete_state.h"
 #include "sms_multipart.h"
 #include "sms_incoming_schema.h"
@@ -450,6 +452,20 @@ static int db_open(void)
     }
 }
 
+/** Сформировать UTC-время для durable начала/окончания вызова.
+ * out принадлежит caller; часовой пояс устройства не влияет на формат.
+ */
+static void call_timestamp(char* out, size_t len)
+{
+    time_t now = time(NULL);
+    struct tm utc;
+    gmtime_r(&now, &utc);
+    strftime(out, len, "%Y-%m-%d %H:%M:%S UTC", &utc);
+}
+
+/** Инициализировать SQLite и восстановить незакрытые вызовы после рестарта.
+ * При ошибке schema/recovery модуль не считает журнал и очередь готовыми.
+ */
 static int db_init()
 {
     if (smsdb) {
@@ -459,7 +475,15 @@ static int db_init()
     if (db_open() || db_create() || db_init_statements()) {
         return -1;
     }
-
+    if (call_log_schema_ensure(smsdb)) {
+        ast_log(LOG_ERROR, "smsdb: call journal schema unavailable; continuing existing SMS operation\n");
+        return 0;
+    }
+    char now[64];
+    call_timestamp(now, sizeof(now));
+    if (call_log_recover(smsdb, now)) {
+        ast_log(LOG_ERROR, "smsdb: call journal recovery failed; continuing with per-call errors logged\n");
+    }
     return 0;
 }
 
@@ -1215,6 +1239,67 @@ static int bind_int_or_null(sqlite3_stmt* stmt, int colno, int val)
         return sqlite3_bind_null(stmt, colno);
     }
     return sqlite3_bind_int(stmt, colno, val);
+}
+
+/** Адаптировать начало вызова к общему smsdb connection и текущему UTC времени.
+ * DB mutex защищает соединение; call_log_start выполняет собственную транзакцию.
+ */
+int smsdb_call_start(const char* device, int call_idx, int direction, const char* number, char* call_id, size_t call_id_len)
+{
+    char started[64];
+    call_timestamp(started, sizeof(started));
+    SCOPED_DB(smsdb);
+    return call_log_start(smsdb, device, call_idx, (call_log_direction_t)direction, number, started, call_id, call_id_len);
+}
+
+/** Сохранить отдельное поколение входящего по явному unsolicited-событию.
+ * Использовать только если event-correlation helper обнаружил release barrier.
+ */
+int smsdb_call_start_new_generation(const char* device, int call_idx, const char* number, char* call_id, size_t call_id_len)
+{
+    char started[64];
+    call_timestamp(started, sizeof(started));
+    SCOPED_DB(smsdb);
+    return call_log_start_new_generation(smsdb, device, call_idx, number, started, call_id, call_id_len);
+}
+
+/** Передать подтверждённый ACTIVE event в durable журнал входящего звонка. */
+int smsdb_call_answer(const char* call_id)
+{
+    SCOPED_DB(smsdb);
+    return call_log_answer(smsdb, call_id);
+}
+
+/** Сохранить текущий CLCC индекс для корреляции без смены вечного ID. */
+int smsdb_call_set_index(const char* call_id, int call_idx)
+{
+    SCOPED_DB(smsdb);
+    return call_log_set_index(smsdb, call_id, call_idx);
+}
+
+/** Завершить вызов с UTC временем; missed row и очередь уведомления атомарны. */
+int smsdb_call_finish(const char* call_id, int answered)
+{
+    char ended[64];
+    call_timestamp(ended, sizeof(ended));
+    SCOPED_DB(smsdb);
+    return call_log_finish(smsdb, call_id, answered, ended);
+}
+
+/** Найти durable ID по временному индексу, если PBX-канал отсутствует. */
+int smsdb_call_active_id(const char* device, int call_idx, char* call_id, size_t call_id_len)
+{
+    SCOPED_DB(smsdb);
+    return call_log_active_id(smsdb, device, call_idx, call_id, call_id_len);
+}
+
+/** Подтвердить завершение только по свежему modem snapshot под smsdb connection lock. */
+int smsdb_call_release_confirm(const char* call_id, int slot_present)
+{
+    char ended[64];
+    call_timestamp(ended, sizeof(ended));
+    SCOPED_DB(smsdb);
+    return call_log_release_confirm(smsdb, call_id, slot_present, ended);
 }
 
 int smsdb_mt_put(const char* device, const char* mid, const char* from_num, const char* msg, const char* ts)

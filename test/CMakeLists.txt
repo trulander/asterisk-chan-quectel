@@ -86,6 +86,30 @@ target_link_libraries(ctq_sms_delete_flow_sqlite_test PRIVATE SQLite::SQLite3 Th
 target_compile_options(ctq_sms_delete_flow_sqlite_test PRIVATE -Wall -Wextra)
 add_test(NAME sms-delete-flow-sqlite COMMAND ctq_sms_delete_flow_sqlite_test)
 
+# Журнал звонков: production-транзакции SQLite и существующий MT queue helper.
+# Покрыты типы, идемпотентность, SIM, повтор индекса, рестарт и откат COMMIT.
+add_executable(ctq_call_log_test
+    call_log_test.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_multipart.c
+)
+target_include_directories(ctq_call_log_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_call_log_test PRIVATE SQLite::SQLite3)
+target_compile_options(ctq_call_log_test PRIVATE -Wall -Wextra)
+add_test(NAME call-log COMMAND ctq_call_log_test)
+
+# Строгий production CLCC parser и связанный snapshot-invalid/retry/finish flow на SQLite.
+add_executable(ctq_clcc_parser_test
+    clcc_parser_test.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/clcc_parser.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_multipart.c
+)
+target_include_directories(ctq_clcc_parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_clcc_parser_test PRIVATE SQLite::SQLite3)
+target_compile_options(ctq_clcc_parser_test PRIVATE -Wall -Wextra)
+add_test(NAME clcc-parser COMMAND ctq_clcc_parser_test)
+
 # sms_tx: независимые SQLite transaction primitives src/sms_tx.[ch]. Проверяются nested-BEGIN,
 # параллельные begin/commit одного connection, failed COMMIT→ROLLBACK, failed BEGIN,
 # SQLITE_BUSY без утечки transaction, повтор seqorder и NULL SRR mapping.

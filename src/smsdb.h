@@ -6,6 +6,7 @@
 #define CHAN_QUECTEL_SMSDB_H_INCLUDED
 
 #include "dc_config.h" /* DEVNAMELEN */
+#include "call_log.h"
 #include "sms_paging.h" /* struct sms_paging_row / unified SMS history */
 #include "sms_incoming_paging.h"
 
@@ -49,6 +50,22 @@ struct smsdb_mt_out_row {
 
 int smsdb_init();
 void smsdb_atexit();
+/** Создать/найти durable запись звонка; ID возвращается caller-owned буферу.
+ * direction: 1 входящий, 2 исходящий; call_idx только текущая корреляция.
+ */
+int smsdb_call_start(const char* device, int call_idx, int direction, const char* number, char* call_id, size_t call_id_len);
+/** Создать отдельный incoming ID для нового unsolicited поколения после pending RELEASED. */
+int smsdb_call_start_new_generation(const char* device, int call_idx, const char* number, char* call_id, size_t call_id_len);
+/** Зафиксировать факт ответа по call ID; 0 success, -1 DB failure. */
+int smsdb_call_answer(const char* call_id);
+/** Обновить временный индекс по устойчивому ID. */
+int smsdb_call_set_index(const char* call_id, int call_idx);
+/** Завершить по устойчивому ID: входящий пропуск и MT уведомление атомарны. */
+int smsdb_call_finish(const char* call_id, int answered);
+/** Найти открытый входящий по текущему device/index для звонка без PBX-канала. */
+int smsdb_call_active_id(const char* device, int call_idx, char* call_id, size_t call_id_len);
+/** Завершить кандидат только после CLCC-снимка; занятый index сохраняет строку. */
+int smsdb_call_release_confirm(const char* call_id, int slot_present);
 int smsdb_put(const char* id, const char* addr, int ref, int parts, int order, const char* msg, struct ast_str** out);
 /** Сохранить segment из SIM в incoming_msg с exact SM/device/index identity.
  * При вызове удерживает общий smsdb mutex и транзакционно сохраняет сегмент/assembly;

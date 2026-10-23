@@ -48,6 +48,10 @@ static const unsigned int CLCC_CALL_TYPE_DATA = 1;
 static const unsigned int CLCC_CALL_TYPE_FAX = 2;
 */
 
+static void queue_pending_call_releases(struct pvt* pvt);
+static void complete_call_release_snapshot(struct pvt* pvt);
+static void discard_call_release_snapshot(struct pvt* pvt);
+
 static const char MANUFACTURER_QUECTEL[] = "Quectel";
 static const char MANUFACTURER_SIMCOM[]  = "SimCom";
 
@@ -316,6 +320,7 @@ static void sms_flow_defer_retry(void* opaque)
  * pvt/task/ecmd принадлежат serialized AT pipeline и живут до завершения handler;
  * для CMGD DB transition выполняется после modem OK. Если persist не удался,
  * CMGD_SENT оставляют due для restart picker, который делает fresh CMGL, не replay.
+ * Успешный CLCC OK также закрывает release candidate только после свежего snapshot.
  * Возвращаемый int — прежний response dispatch contract; SQLite mutex освобождается
  * внутри smsdb API до дальнейшей обработки ответа.
  */
@@ -347,7 +352,6 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
         case CMD_AT_CHLD_2:
         case CMD_AT_CHLD_3:
         case CMD_AT_CSCA:
-        case CMD_AT_CLCC:
         case CMD_AT_CLIR:
         case CMD_AT_QINDCFG_CSQ:
         case CMD_AT_QINDCFG_ACT:
@@ -363,6 +367,11 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
             at_ok_response_dbg(3, pvt, ecmd, NULL);
             break;
 
+        case CMD_AT_CLCC:
+            complete_call_release_snapshot(pvt);
+            at_ok_response_dbg(3, pvt, ecmd, NULL);
+            break;
+
         case CMD_AT_FINAL:
             ast_verb(1, "[%s] Channel initialized\n", PVT_ID(pvt));
             if (CONF_UNIQ(pvt, uac) == TRIBOOL_NONE) {
@@ -373,6 +382,7 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
             }
             at_enqueue_csq(task->cpvt);
             pvt->initialized = 1;
+            queue_pending_call_releases(pvt);
             break;
 
         case CMD_AT_COPS_INIT:
@@ -526,6 +536,7 @@ static int at_response_ok(struct pvt* const pvt, const at_res_t at_res, const at
                 at_ok_response_err(pvt, ecmd, "Call idx:%d is still active after the hangup retry", task->cpvt->call_idx);
             }
             CPVT_RESET_FLAG(task->cpvt, CALL_FLAG_HANGUP_CLCC_ALIVE);
+            complete_call_release_snapshot(pvt);
             break;
 
         case CMD_AT_CMGS:
@@ -737,18 +748,11 @@ static void __attribute__((format(printf, 7, 8))) at_err_response_log(int level,
 #define at_err_response_err(pvt, ecmd, ...) at_err_response_log(LOG_ERROR, pvt, ecmd, __VA_ARGS__)
 #define at_err_response_wrn(pvt, ecmd, ...) at_err_response_log(LOG_WARNING, pvt, ecmd, __VA_ARGS__)
 
-/*!
- * \brief Handle ERROR response
- * \param pvt -- pvt structure
- * \retval  0 success
- * \retval -1 error
- */
-
-/** Обработать AT ERROR/TIMEOUT и сохранить uncertain CMGD до новой проверки.
- * task несёт durable rowid, ecmd идентифицирует текущую команду; владение ими
- * остаётся AT queue. Старый CMGD не повторяется: handler durable переводит state
- * и ставит свежую SIM verification; временный DB/read failure только переносит retry.
- * Возвращает прежний результат общего response dispatch, не держит DB lock вокруг AT enqueue.
+/** Обработать AT ERROR/TIMEOUT для SMS удаления и CLCC release-кандидатов.
+ * task/ecmd принадлежат сериализованной AT очереди; старый CMGD не повторяется,
+ * а неудачный CLCC не считается доказательством отсутствия вызова и снимает только
+ * свой barrier. DB ошибки сохраняют возможность последующего повторного чтения.
+ * Возвращает прежний response dispatch результат; DB lock не удерживается вокруг AT enqueue.
  */
 static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const at_queue_task_t* const task, const at_queue_cmd_t* const ecmd)
 {
@@ -768,6 +772,7 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
         case CMD_AT_Z:
         case CMD_AT_E:
         case CMD_AT_CLCC:
+            discard_call_release_snapshot(pvt);
             at_err_response_err(pvt, ecmd, NULL);
             /* mean disconnected from device */
             goto e_return;
@@ -953,6 +958,7 @@ static int at_response_error(struct pvt* const pvt, const at_res_t at_res, const
             break;
 
         case CMD_AT_CLCC_HANGUP:
+            discard_call_release_snapshot(pvt);
             CPVT_RESET_FLAGS(task->cpvt, CALL_FLAG_HANGUP_VERIFY | CALL_FLAG_HANGUP_CLCC_ALIVE);
             at_err_response_err(pvt, ecmd, "Could not verify hangup state for call idx:%d", task->cpvt->call_idx);
             break;
@@ -1140,7 +1146,11 @@ e_return:
     return -1;
 }
 
-static int start_pbx(struct pvt* const pvt, const char* const number, const int call_idx, const call_state_t state)
+/** Создать PBX-канал для уже durable записанного входящего вызова.
+ * call_log_id принадлежит вызывающему событию; при отсутствии передаётся NULL.
+ * Ошибка запуска сохраняет строку вызова, чтобы RELEASED/restart всё равно её завершил.
+ */
+static int start_pbx(struct pvt* const pvt, const char* const number, const int call_idx, const call_state_t state, const char* call_log_id)
 {
     /* TODO: pass also Subscriber number or other DID info for exten  */
     struct ast_channel* channel = channel_new(pvt, AST_STATE_RING, number, call_idx, CALL_DIR_INCOMING, state,
@@ -1159,6 +1169,9 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int 
     struct cpvt* const cpvt = ast_channel_tech_pvt(channel);
     // FIXME: not execute if channel_new() failed
     CPVT_SET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
+    if (call_log_id) {
+        snprintf(cpvt->call_log_id, sizeof(cpvt->call_log_id), "%s", call_log_id);
+    }
 
     /* ast_pbx_start() usually failed if asterisk.conf minmemfree
      * set too low, try drop buffer cache
@@ -1177,22 +1190,219 @@ static int start_pbx(struct pvt* const pvt, const char* const number, const int 
     return 0;
 }
 
+/** Посчитать уже сериализованные CLCC snapshots старше нового release candidate.
+ * pvt lock удерживается response taskprocessor; каждый command entry принадлежит AT queue.
+ */
+static unsigned int queued_call_snapshots(const struct pvt* pvt)
+{
+    const at_queue_task_t* task;
+    unsigned int count = 0;
+    AST_LIST_TRAVERSE(&pvt->at_queue, task, entry) {
+        for (unsigned int i = task->cindex; i < task->cmdsno; ++i) {
+            if (task->cmds[i].cmd == CMD_AT_CLCC || task->cmds[i].cmd == CMD_AT_CLCC_HANGUP) ++count;
+        }
+    }
+    return count;
+}
+
+/** Поставить CLCC snapshot за уже ожидающимися CLCC задачами.
+ * skip counter защищает от ответа, запрос которого отправлен до release event.
+ */
+static void queue_call_release_verification(struct pvt* pvt, unsigned int slot)
+{
+    pvt->call_release[slot].skip_clcc = queued_call_snapshots(pvt);
+    pvt->call_release[slot].seen = 0;
+    if (at_enqueue_clcc(&pvt->sys_chan)) {
+        pvt->call_release[slot].verification_queued = 0;
+        ast_log(LOG_ERROR, "[%s] Cannot queue fresh CLCC release verification idx:%d\n", PVT_ID(pvt), pvt->call_release[slot].call_idx);
+    } else {
+        pvt->call_release[slot].verification_queued = 1;
+    }
+}
+
+/** Повторно поставить pending CLCC-проверки после успешного modem init.
+ * Кандидаты переживают AT error/reconnect только в памяти; SQLite restart recovery
+ * остаётся отдельным durable механизмом для уже записанных открытых вызовов.
+ */
+static void queue_pending_call_releases(struct pvt* pvt)
+{
+    for (unsigned int i = 0; i < 32; ++i) {
+        if (pvt->call_release[i].active && !pvt->call_release[i].verification_queued) {
+            queue_call_release_verification(pvt, i);
+        }
+    }
+}
+
+/** Сохранить no-channel/CPVT release как кандидата до fresh CLCC snapshot.
+ * Устойчивый ID копируется в pvt; index не используется для finish без snapshot.
+ */
+static void defer_call_release(struct pvt* pvt, struct cpvt* cpvt, int call_idx, unsigned int dir)
+{
+    char id[CALL_LOG_ID_LEN] = "";
+    if (cpvt && cpvt->call_log_id[0]) {
+        snprintf(id, sizeof(id), "%s", cpvt->call_log_id);
+    } else if (dir == CALL_DIR_INCOMING && smsdb_call_active_id(PVT_ID(pvt), call_idx, id, sizeof(id)) <= 0) {
+        return;
+    }
+    if (!id[0]) return;
+
+    unsigned int slot = 32;
+    for (unsigned int i = 0; i < 32; ++i) {
+        if (pvt->call_release[i].active && pvt->call_release[i].call_idx == call_idx &&
+            strcmp(pvt->call_release[i].call_id, id) == 0) {
+            if (!pvt->call_release[i].verification_queued) queue_call_release_verification(pvt, i);
+            return;
+        }
+        if (!pvt->call_release[i].active && slot == 32) slot = i;
+    }
+    if (slot == 32) {
+        ast_log(LOG_ERROR, "[%s] No slot for pending call release verification idx:%d\n", PVT_ID(pvt), call_idx);
+        return;
+    }
+    snprintf(pvt->call_release[slot].call_id, sizeof(pvt->call_release[slot].call_id), "%s", id);
+    pvt->call_release[slot].successor_id[0] = '\0';
+    pvt->call_release[slot].call_idx = call_idx;
+    pvt->call_release[slot].active = 1;
+    queue_call_release_verification(pvt, slot);
+}
+
+/** Отметить слот занятым в CLCC snapshot, не завершая call row по одному индексу.
+ * Вызов происходит до фильтров mode/state: любой занятый modem slot запрещает finish.
+ */
+static void mark_call_release_seen(struct pvt* pvt, int call_idx)
+{
+    for (unsigned int i = 0; i < 32; ++i) {
+        if (pvt->call_release[i].active && pvt->call_release[i].call_idx == call_idx) pvt->call_release[i].seen = 1;
+    }
+}
+
+/** Завершить release candidate только по snapshot, поставленному после события.
+ * Ранее поставленные CLCC ответы уменьшают skip counter; активный слот отменяет
+ * кандидата, отсутствующий слот делает устойчивый-ID finish и затем освобождает cpvt.
+ */
+static void complete_call_release_snapshot(struct pvt* pvt)
+{
+    const int snapshot_valid = !pvt->call_release_snapshot_invalid;
+    pvt->call_release_snapshot_invalid = 0;
+    for (unsigned int i = 0; i < 32; ++i) {
+        if (!pvt->call_release[i].active) continue;
+        const call_log_snapshot_result_t decision =
+            call_log_release_snapshot_decide(&pvt->call_release[i].skip_clcc, pvt->call_release[i].seen,
+                                             snapshot_valid);
+        if (decision == CALL_LOG_SNAPSHOT_INVALID) {
+            /* Терминальный OK после неполного ответа не подтверждает отсутствие; taskproc поставит CLCC заново. */
+            (void)call_log_release_snapshot_retry(&pvt->call_release[i].skip_clcc,
+                                                  &pvt->call_release[i].verification_queued,
+                                                  &pvt->call_release[i].seen);
+            continue;
+        }
+        if (decision == CALL_LOG_SNAPSHOT_OLDER) {
+            pvt->call_release[i].seen = 0;
+            if (!pvt->call_release[i].skip_clcc && !pvt->call_release[i].verification_queued) {
+                queue_call_release_verification(pvt, i);
+            }
+            continue;
+        }
+        const int present = decision == CALL_LOG_SNAPSHOT_PRESENT;
+        const int finish_release = call_log_release_should_finish(present, pvt->call_release[i].successor_id[0] != '\0');
+        const int finish_error = finish_release
+                                     ? smsdb_call_finish(pvt->call_release[i].call_id, 0)
+                                     : smsdb_call_release_confirm(pvt->call_release[i].call_id, 1);
+        if (finish_error) {
+            ast_log(LOG_ERROR, "[%s] Cannot commit call release verification idx:%d\n", PVT_ID(pvt), pvt->call_release[i].call_idx);
+            pvt->call_release[i].seen = 0;
+            continue;
+        }
+        if (!present) {
+            struct cpvt* cpvt = pvt_channel_find_by_call_idx(pvt, pvt->call_release[i].call_idx);
+            if (cpvt && strcmp(cpvt->call_log_id, pvt->call_release[i].call_id) == 0 && cpvt->state != CALL_STATE_RELEASED) {
+                cpvt_change_state(cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_CLEARING);
+            }
+            pvt->ring = pvt->dialing = pvt->cwaiting = 0;
+        }
+        pvt->call_release[i].active = 0;
+        pvt->call_release[i].verification_queued = 0;
+        pvt->call_release[i].call_id[0] = '\0';
+        pvt->call_release[i].successor_id[0] = '\0';
+    }
+}
+
+/** Снять barrier для ответа CLCC, который завершился ошибкой.
+ * Ошибочный ответ не подтверждает отсутствие слота; следующий успешный snapshot
+ * остаётся необходимым и не должен быть пропущен из-за устаревшего счётчика.
+ */
+static void discard_call_release_snapshot(struct pvt* pvt)
+{
+    for (unsigned int i = 0; i < 32; ++i) {
+        if (!pvt->call_release[i].active) continue;
+        if (call_log_release_snapshot_retry(&pvt->call_release[i].skip_clcc,
+                                            &pvt->call_release[i].verification_queued,
+                                            &pvt->call_release[i].seen)) {
+            queue_call_release_verification(pvt, i);
+        }
+    }
+}
+
+/** Применить очередной CLCC/DSCI/CCINFO переход к channel и durable журналу.
+ * unsolicited incoming после release barrier получает новый ID; CLCC повторы остаются
+ * дедуплицированными, а busy verification завершает только известное старое поколение.
+ */
 static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, const unsigned int dir, const unsigned int state, const unsigned int mode,
-                        const tristate_bool_t mpty, const char* const number, const unsigned int type)
+                        const tristate_bool_t mpty, const char* const number, const unsigned int type, call_log_event_origin_t origin)
 {
     struct cpvt* cpvt = pvt_channel_find_by_call_idx(pvt, (int)call_idx);
     int process_state = 1;
+    char incoming_call_id[CALL_LOG_ID_LEN] = "";
+
+    /* Направление события проверяется до любой durable записи и смены состояния. */
+    if (cpvt && !call_log_direction_matches(dir, CPVT_DIRECTION(cpvt))) {
+        ast_log(LOG_ERROR, "[%s] CLCC call idx:%d - direction mismatch %d/%d\n", PVT_ID(pvt), cpvt->call_idx, dir, CPVT_DIRECTION(cpvt));
+        return;
+    }
+    if (state == CALL_STATE_RELEASED) {
+        defer_call_release(pvt, cpvt, (int)call_idx, dir);
+        return;
+    }
+
+    if (dir == CALL_DIR_INCOMING && (state == CALL_STATE_INCOMING || state == CALL_STATE_WAITING || state == CALL_STATE_ACTIVE)) {
+        int release_slot = -1;
+        int successor_slot = -1;
+        for (unsigned int i = 0; i < 32; ++i) {
+            if (!pvt->call_release[i].active || pvt->call_release[i].call_idx != (int)call_idx) continue;
+            if (pvt->call_release[i].successor_id[0]) successor_slot = (int)i;
+            else release_slot = (int)i;
+        }
+        const call_log_event_state_t event_state = state == CALL_STATE_INCOMING
+                                                        ? CALL_LOG_EVENT_STATE_INCOMING
+                                                        : state == CALL_STATE_WAITING
+                                                              ? CALL_LOG_EVENT_STATE_WAITING
+                                                              : CALL_LOG_EVENT_STATE_ACTIVE;
+        const call_log_generation_decision_t generation =
+            call_log_incoming_generation_decide(origin, 1, event_state, release_slot >= 0, successor_slot >= 0);
+        if (generation == CALL_LOG_GENERATION_NEW) {
+            if (smsdb_call_start_new_generation(PVT_ID(pvt), (int)call_idx, number, incoming_call_id, sizeof(incoming_call_id))) {
+                ast_log(LOG_ERROR, "[%s] Cannot persist new incoming generation idx:%u\n", PVT_ID(pvt), call_idx);
+                incoming_call_id[0] = '\0';
+            } else {
+                ast_copy_string(pvt->call_release[release_slot].successor_id, incoming_call_id,
+                                sizeof(pvt->call_release[release_slot].successor_id));
+                if (cpvt && strcmp(cpvt->call_log_id, pvt->call_release[release_slot].call_id) == 0) {
+                    ast_copy_string(cpvt->call_log_id, incoming_call_id, sizeof(cpvt->call_log_id));
+                }
+            }
+        } else if (generation == CALL_LOG_GENERATION_USE_SUCCESSOR) {
+            ast_copy_string(incoming_call_id, pvt->call_release[successor_slot].successor_id, sizeof(incoming_call_id));
+        } else if (smsdb_call_start(PVT_ID(pvt), (int)call_idx, CALL_LOG_INCOMING, number, incoming_call_id, sizeof(incoming_call_id))) {
+            ast_log(LOG_ERROR, "[%s] Cannot persist incoming call idx:%u\n", PVT_ID(pvt), call_idx);
+            incoming_call_id[0] = '\0';
+        }
+    }
 
     if (cpvt) {
         /* cpvt alive */
         CPVT_SET_FLAG(cpvt, CALL_FLAG_ALIVE);
         if (CPVT_TEST_FLAG(cpvt, CALL_FLAG_HANGUP_VERIFY)) {
             CPVT_SET_FLAG(cpvt, CALL_FLAG_HANGUP_CLCC_ALIVE);
-        }
-
-        if (dir != CPVT_DIRECTION(cpvt)) {
-            ast_log(LOG_ERROR, "[%s] CLCC call idx:%d - direction mismatch %d/%d\n", PVT_ID(pvt), cpvt->call_idx, dir, CPVT_DIRECTION(cpvt));
-            return;
         }
 
         if (mpty) {
@@ -1230,6 +1440,11 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
 
                 if (cpvt) {
                     cpvt->call_idx = (short)call_idx;
+                    if (CPVT_DIR_OUTGOING(cpvt) && cpvt->call_log_id[0]) {
+                        if (smsdb_call_set_index(cpvt->call_log_id, (int)call_idx)) {
+                            ast_log(LOG_ERROR, "[%s] Cannot update outgoing call index %u\n", PVT_ID(pvt), call_idx);
+                        }
+                    }
                     process_state  = cpvt_change_state(cpvt, state, 0);
                 } else {
                     at_enqueue_hangup(&pvt->sys_chan, call_idx, AST_CAUSE_CALL_REJECTED);
@@ -1253,11 +1468,19 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
     }
 
     switch (state) {
-        case CALL_STATE_ACTIVE:
+        case CALL_STATE_ACTIVE: {
+            if (dir == CALL_DIR_INCOMING) {
+                char* id = incoming_call_id[0] ? incoming_call_id : (cpvt && cpvt->call_log_id[0] ? cpvt->call_log_id : incoming_call_id);
+                if (!id[0] && smsdb_call_active_id(PVT_ID(pvt), (int)call_idx, incoming_call_id, sizeof(incoming_call_id)) > 0) id = incoming_call_id;
+                if (id[0] && smsdb_call_answer(id)) {
+                    ast_log(LOG_ERROR, "[%s] Cannot persist answered call idx:%u\n", PVT_ID(pvt), call_idx);
+                }
+            }
             if (cpvt && pvt->is_simcom && CONF_UNIQ(pvt, uac) == TRIBOOL_FALSE && pvt->has_voice) {
                 at_enqueue_cpcmreg(cpvt, 1);
             }
             break;
+        }
 
         case CALL_STATE_DIALING: {
             pvt->dialing  = 1;
@@ -1287,7 +1510,7 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
 
             if (pvt_enabled(pvt)) {
                 /* TODO: give dialplan level user tool for checking device is voice enabled or not  */
-                if (start_pbx(pvt, number, call_idx, state)) {
+                if (start_pbx(pvt, number, call_idx, state, incoming_call_id[0] ? incoming_call_id : NULL)) {
                     PVT_STAT(pvt, in_pbx_fails)++;
                 } else {
                     PVT_STAT(pvt, in_calls_handled)++;
@@ -1309,7 +1532,7 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
             if (dir == CALL_DIR_INCOMING) {
                 if (pvt_enabled(pvt)) {
                     /* TODO: give dialplan level user tool for checking device is voice enabled or not  */
-                    if (start_pbx(pvt, number, call_idx, state) == 0) {
+                    if (start_pbx(pvt, number, call_idx, state, incoming_call_id[0] ? incoming_call_id : NULL) == 0) {
                         PVT_STAT(pvt, in_calls_handled)++;
                         if (!pvt->has_voice) {
                             ast_log(LOG_WARNING, "[%s] pbx started for device not voice capable\n", PVT_ID(pvt));
@@ -1322,14 +1545,7 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
             break;
         }
 
-        case CALL_STATE_RELEASED: {  // CALL END
-            pvt->ring     = 0;
-            pvt->dialing  = 0;
-            pvt->cwaiting = 0;
-
-            if (cpvt && pvt->is_simcom && CONF_UNIQ(pvt, uac) == TRIBOOL_FALSE && pvt->has_voice) {
-                at_enqueue_cpcmreg(&pvt->sys_chan, 0);
-            }
+        case CALL_STATE_RELEASED: {  /* Переход обработан выше после проверки CLCC snapshot. */
             break;
         }
 
@@ -1365,19 +1581,19 @@ static const char* next_line(const char* const str)
     return NULL;
 }
 
-/*!
- * \brief Handle +CLCC response
- * \param pvt -- pvt structure
- * \param result -- string containing response
- * \retval  0 success
- * \retval -1 error
+/** Разобрать все строки AT+CLCC и отметить занятые индексы для pending release.
+ * pvt защищён taskprocessor lock; response принадлежит текущему AT событию.
+ * Ошибочные строки пропускаются, а отсутствие подтверждается только позже на OK.
+ * Возвращает 0 по существующему response contract; DB здесь не меняется.
  */
-
 static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const response)
 {
     static const ssize_t LINE_DEF_LEN = 128;
 
+    pvt->call_release_snapshot_invalid = 0;
     if (!pvt->initialized) {
+        /* До полной инициализации modem response не является достоверным snapshot. */
+        pvt->call_release_snapshot_invalid = 1;
         return 0;
     }
 
@@ -1395,20 +1611,23 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
 
         if (at_parse_clcc(ast_str_buffer(line), &call_idx, &dir, &state, &mode, &mpty, &number, &type)) {
             ast_log(LOG_ERROR, "[%s] CLCC - can't parse line '%s'\n", PVT_ID(pvt), ast_str_buffer(line));
+            pvt->call_release_snapshot_invalid = 1;
             continue;
         }
+        if (!call_idx || dir > CALL_DIR_INCOMING || state > CALL_STATE_WAITING || mpty > 1 || mode > 2) {
+            ast_log(LOG_ERROR, "[%s] CLCC - invalid field idx:%u dir:%u state:%u mode:%u mpty:%u\n",
+                    PVT_ID(pvt), call_idx, dir, state, mode, mpty);
+            pvt->call_release_snapshot_invalid = 1;
+            continue;
+        }
+        mark_call_release_seen(pvt, (int)call_idx);
 
         if (mode != CLCC_CALL_TYPE_VOICE) {
-            ast_debug(4, "[%s] CLCC - non-voice call, idx:%u dir:%u state:%u nubmer:%s\n", PVT_ID(pvt), call_idx, dir, state, number);
+            ast_debug(4, "[%s] CLCC - non-voice call, idx:%u dir:%u state:%u number:%s\n", PVT_ID(pvt), call_idx, dir, state, number);
             continue;
         }
 
-        if (mode > CALL_STATE_WAITING) {
-            ast_debug(4, "[%s] CLCC - invalid call state, idx:%u dir:%u state:%u nubmer:%s\n", PVT_ID(pvt), call_idx, dir, state, number);
-            continue;
-        }
-
-        handle_clcc(pvt, call_idx, dir, state, mode, mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, number, type);
+        handle_clcc(pvt, call_idx, dir, state, mode, mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, number, type, CALL_LOG_EVENT_CLCC);
     }
 
     return 0;
@@ -1454,14 +1673,16 @@ static int at_response_dsci(struct pvt* const pvt, const struct ast_str* const r
 
     switch (call_state) {
         case CALL_STATE_RELEASED:  // released call will not be listed by AT+CLCC command, handle directly
-            handle_clcc(pvt, call_index, call_dir, map_dsci(call_state), call_type, TRIBOOL_NONE, number, number_type);
+            handle_clcc(pvt, call_index, call_dir, map_dsci(call_state), call_type, TRIBOOL_NONE, number, number_type,
+                        CALL_LOG_EVENT_UNSOLICITED);
             break;
 
         default:  // request CLCC anyway
             if (CONF_SHARED(pvt, multiparty)) {
                 request_clcc(pvt);
             } else {
-                handle_clcc(pvt, call_index, call_dir, map_dsci(call_state), call_type, TRIBOOL_NONE, number, number_type);
+                handle_clcc(pvt, call_index, call_dir, map_dsci(call_state), call_type, TRIBOOL_NONE, number, number_type,
+                            CALL_LOG_EVENT_UNSOLICITED);
             }
             break;
     }
@@ -1537,7 +1758,8 @@ static int at_response_qind(struct pvt* const pvt, const struct ast_str* const r
                 ast_log(LOG_ERROR, "[%s] Fail to parse CCINFO - %s\n", PVT_ID(pvt), params);
                 break;
             }
-            handle_clcc(pvt, call_idx, dir, state, mode, mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, number, toa);
+            handle_clcc(pvt, call_idx, dir, state, mode, mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, number, toa,
+                        CALL_LOG_EVENT_UNSOLICITED);
             return 0;
         }
 
@@ -3361,6 +3583,10 @@ struct at_response_taskproc_data* at_response_taskproc_data_alloc(struct pvt* co
     return res;
 }
 
+/** Обработать один serial AT event под pvt lock и не терять release verification.
+ * Ошибка/timeout не трактуется как отсутствие вызова; после снятия завершённой
+ * команды response-task сразу ставит новую сериализованную CLCC-проверку.
+ */
 static void response_taskproc(struct pvt_taskproc_data* ptd)
 {
     RAII_VAR(struct at_response_taskproc_data* const, rtd, (struct at_response_taskproc_data*)ptd, ast_free);
@@ -3374,6 +3600,10 @@ static void response_taskproc(struct pvt_taskproc_data* ptd)
     if (at_response(rtd->ptd.pvt, &rtd->response, at_res)) {
         ast_log(LOG_WARNING, "[%s] Fail to handle response\n", PVT_ID(rtd->ptd.pvt));
     }
+    /* Любой завершившийся response, включая ERROR/TIMEOUT, продвигает pending retry;
+     * текущая verification command уже снята с очереди до этого taskprocessor callback.
+     */
+    queue_pending_call_releases(rtd->ptd.pvt);
 
     if (at_queue_run(rtd->ptd.pvt)) {
         ast_log(LOG_ERROR, "[%s] Fail to run command from queue\n", PVT_ID(rtd->ptd.pvt));
