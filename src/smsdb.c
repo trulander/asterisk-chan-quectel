@@ -37,6 +37,7 @@
 #include "sms_multipart.h"
 #include "sms_incoming_schema.h"
 #include "sms_incoming_paging.h"
+#include "sim_metrics.h"
 
 /* Map the dependency-free transaction logging hook to ast_log so every
  * BEGIN/COMMIT/ROLLBACK failure surfaces in messages with the thread-id and the
@@ -1651,6 +1652,21 @@ int smsdb_sms_count(const char* device, int* total)
         ast_log(LOG_ERROR, "smsdb: unified SMS count failed (device=%s): [%d] %s\n",
                 (device && !ast_strlen_zero(device)) ? device : "(all)", sqlite3_errcode(smsdb), sqlite3_errmsg(smsdb));
     }
+    return res;
+}
+
+/** Считать метрики главной страницы под одним захватом общего DB mutex.
+ * SQL-модуль не закрывает connection; при любой ошибке возвращается -1 и пишется причина SQLite.
+ */
+int smsdb_sim_metrics(const char* device, struct sim_metrics* out)
+{
+    int res;
+    SCOPED_DB(smsdb);
+    if (!out) return -1;
+    res = sms_paging_count(smsdb, device, &out->sms_total);
+    if (!res) res = sim_metrics_read(smsdb, device, out);
+    if (res) ast_log(LOG_ERROR, "smsdb: SIM metrics failed (device=%s): [%d] %s\n",
+                     device ? device : "(null)", sqlite3_errcode(smsdb), sqlite3_errmsg(smsdb));
     return res;
 }
 

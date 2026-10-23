@@ -110,6 +110,18 @@ target_link_libraries(ctq_clcc_parser_test PRIVATE SQLite::SQLite3)
 target_compile_options(ctq_clcc_parser_test PRIVATE -Wall -Wextra)
 add_test(NAME clcc-parser COMMAND ctq_clcc_parser_test)
 
+# Per-SIM home metrics и HTML-фрагмент: production SQL/renderer на in-memory SQLite.
+add_executable(ctq_sim_metrics_test
+    sim_metrics_test.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sim_metrics.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_paging.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/web_sim_metrics.c
+)
+target_include_directories(ctq_sim_metrics_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_sim_metrics_test PRIVATE SQLite::SQLite3)
+target_compile_options(ctq_sim_metrics_test PRIVATE -Wall -Wextra)
+add_test(NAME sim-metrics COMMAND ctq_sim_metrics_test)
+
 # sms_tx: независимые SQLite transaction primitives src/sms_tx.[ch]. Проверяются nested-BEGIN,
 # параллельные begin/commit одного connection, failed COMMIT→ROLLBACK, failed BEGIN,
 # SQLITE_BUSY без утечки transaction, повтор seqorder и NULL SRR mapping.

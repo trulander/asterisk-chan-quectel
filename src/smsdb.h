@@ -9,6 +9,7 @@
 #include "call_log.h"
 #include "sms_paging.h" /* struct sms_paging_row / unified SMS history */
 #include "sms_incoming_paging.h"
+#include "sim_metrics.h"
 
 #define MT_MID_LEN 128
 #define MT_STATE_LEN 32
@@ -148,6 +149,10 @@ int smsdb_sms_page(const char* device, int page_size, int offset, void* ctx, sms
     \a device is NULL.
     \return 0 on success and stores the count in *total, -1 on error */
 int smsdb_sms_count(const char* device, int* total);
+/** Прочитать per-SIM home-card счётчики под mutex общего SQLite connection.
+ * Ошибка любой требуемой таблицы/SQL возвращает -1; успешный нулевой результат остаётся нулём.
+ */
+int smsdb_sim_metrics(const char* device, struct sim_metrics* out);
 /** Прочитать страницу incoming_msg под общей SMS DB mutex; см. pager контракт в заголовке.
  * device NULL/empty означает все SIM; callback получает копию row только на время вызова.
  * Возвращает 0 при успехе, -1 при SQL/DB error; DB не меняет.

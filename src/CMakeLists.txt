@@ -42,6 +42,8 @@ set(SRC_FILES
     web_util.c
     # Чистые route/escaping/response helpers, используемые production и CTest.
     web_incoming_parts.c
+    sim_metrics.c
+    web_sim_metrics.c
 )
 
 add_library(asterisk-chan-quectel SHARED ${SRC_FILES})

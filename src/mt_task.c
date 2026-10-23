@@ -40,6 +40,7 @@
 #include "smsdb.h"
 #include "web_util.h"
 #include "web_incoming_parts.h"
+#include "web_sim_metrics.h"
 
 // ================================================================
 
@@ -1003,18 +1004,29 @@ static int mt_web_sms_section(struct ast_str** buf, const char* device, const ch
 }
 
 struct mt_status_section_ctx {
-    struct ast_str** buf;
-    int count;
+    struct ast_str** buf; /*!< HTML buffer, принадлежащий обработчику GET /. */
+    int count; /*!< Число отрисованных SIM-карточек. */
+    int db_error; /*!< Флаг ошибки метрик: при нём страница не выдаёт ложные нули. */
 };
 
-/*! SIM status card renderer (called under a locking-safe snapshot). */
+/** Добавить per-SIM счётчики только после успешного чтения всех таблиц.
+ * Snapshot не удерживает SQLite mutex; smsdb wrapper захватывает его отдельно и освобождает
+ * до возврата. Ошибка отмечается в контексте и приводит к HTTP 500 в верхнем renderer.
+ */
 static int mt_html_status_cb(void* ctx, const struct pvt_status_snapshot* snap)
 {
     struct mt_status_section_ctx* const sec = ctx;
     struct ast_str** const buf = sec->buf;
     char dbm[32];
     const int bars = web_util_rssi_bars(snap->rssi);
+    struct sim_metrics metrics;
+    char metrics_html[768];
 
+    if (smsdb_sim_metrics(snap->name, &metrics) ||
+        web_sim_metrics_render(metrics_html, sizeof(metrics_html), snap->name, &metrics)) {
+        sec->db_error = 1;
+        return -1;
+    }
     mt_web_rssi_dbm(snap->rssi, dbm, sizeof(dbm));
 
     ast_str_append(buf, 0, "<div class=\"sim\"><h3>");
@@ -1091,15 +1103,19 @@ static int mt_html_status_cb(void* ctx, const struct pvt_status_snapshot* snap)
     if (!ast_strlen_zero(snap->cell_id)) mt_web_kv(buf, "Cell ID", snap->cell_id);
     if (!ast_strlen_zero(snap->band)) mt_web_kv(buf, "Band", snap->band);
 
+    ast_str_append(buf, 0, "%s", metrics_html);
     ast_str_append(buf, 0, "</table></div>");
     sec->count++;
     return 0;
 }
 
-/*! GET / - SIM status cards only (SMS history is a separate, per-SIM page). */
+/** Обслужить главную GET / с карточками и счётчиками каждой SIM.
+ * Status snapshot читается отдельно от SQLite; callback собирает метрики под smsdb mutex.
+ * При ошибке любой SIM возвращается HTTP 500 вместо неполной страницы с ложными нулями.
+ */
 static void mt_web_status_html(int client_fd)
 {
-    struct mt_status_section_ctx sec = { NULL, 0 };
+    struct mt_status_section_ctx sec = { NULL, 0, 0 };
 
     RAII_VAR(struct ast_str*, buf, ast_str_create(16384), ast_free);
     sec.buf = &buf;
@@ -1108,6 +1124,11 @@ static void mt_web_status_html(int client_fd)
     mt_web_nav(&buf);
     ast_str_append(&buf, 0, "<h1>SIM status</h1>");
     pvt_status_each(&sec, mt_html_status_cb);
+    if (sec.db_error) {
+        mt_web_db_error(client_fd, "home SIM metrics", "text/plain",
+                        "internal error: SIM metrics unavailable", sizeof("internal error: SIM metrics unavailable") - 1);
+        return;
+    }
     if (sec.count == 0) {
         ast_str_append(&buf, 0, "<p class=\"empty\">No SIMs configured.</p>");
     }
