@@ -52,21 +52,22 @@ struct smsdb_mt_out_row {
 
 int smsdb_init();
 void smsdb_atexit();
-/** Создать/найти durable запись звонка; ID возвращается caller-owned буферу.
- * direction: 1 входящий, 2 исходящий; call_idx только текущая корреляция.
+/** Поставить START в bounded RAM FIFO и вернуть зарезервированный call-<rowid>.
+ * direction: 1 входящий, 2 исходящий; call_idx только active correlation. Успех означает
+ * enqueue, не SQLite commit; DB I/O выполняет один writer. trylock/full/OOM возвращает -1.
  */
 int smsdb_call_start(const char* device, int call_idx, int direction, const char* number, char* call_id, size_t call_id_len);
-/** Создать отдельный incoming ID для нового unsolicited поколения после pending RELEASED. */
+/** Enqueue отдельное incoming поколение после pending RELEASED; ID возвращается до DB commit. */
 int smsdb_call_start_new_generation(const char* device, int call_idx, const char* number, char* call_id, size_t call_id_len);
-/** Зафиксировать факт ответа по call ID; 0 success, -1 DB failure. */
+/** Enqueue ANSWER по call ID; 0 означает принято FIFO, -1 queue/lock failure. */
 int smsdb_call_answer(const char* call_id);
-/** Обновить временный индекс по устойчивому ID. */
+/** Enqueue временный index update по stable ID; SQLite writer применяет его позже. */
 int smsdb_call_set_index(const char* call_id, int call_idx);
-/** Завершить по устойчивому ID: входящий пропуск и MT уведомление атомарны. */
+/** Enqueue FINISH; writer атомарно записывает missed status и MT notification. */
 int smsdb_call_finish(const char* call_id, int answered);
-/** Найти открытый входящий по текущему device/index для звонка без PBX-канала. */
+/** Найти активный incoming ID из RAM map без SQLite; -1 если очередь lock занята/не готова. */
 int smsdb_call_active_id(const char* device, int call_idx, char* call_id, size_t call_id_len);
-/** Завершить кандидат только после CLCC-снимка; занятый index сохраняет строку. */
+/** Absent candidate добавляет FIFO FINISH; busy index не меняет call history. */
 int smsdb_call_release_confirm(const char* call_id, int slot_present);
 int smsdb_put(const char* id, const char* addr, int ref, int parts, int order, const char* msg, struct ast_str** out);
 /** Сохранить segment из SIM в incoming_msg с exact SM/device/index identity.

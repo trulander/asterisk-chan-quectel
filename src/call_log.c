@@ -127,6 +127,40 @@ int call_log_start(sqlite3* db, const char* device, int call_idx, call_log_direc
     return call_log_start_internal(db, device, call_idx, direction, number, timestamp, call_id, call_id_len, 0);
 }
 
+/** Сохранить START с заранее зарезервированным ID из async producer.
+ * Writer вставляет явный AUTOINCREMENT rowid; транзакция удерживает SQLite mutex до commit,
+ * чтобы последующие answer/finish из FIFO видели существующую строку. Ошибка откатывает insert.
+ */
+int call_log_start_reserved(sqlite3* db, sqlite3_int64 id, const char* device, int call_idx,
+                            call_log_direction_t direction, const char* number, const char* timestamp)
+{
+    if (!db || id <= 0 || !device || !timestamp ||
+        (direction != CALL_LOG_INCOMING && direction != CALL_LOG_OUTGOING)) return -1;
+    sqlite3_mutex* mutex = sqlite3_db_mutex(db);
+    if (mutex) sqlite3_mutex_enter(mutex);
+    int rc = -1;
+    sqlite3_stmt* stmt = NULL;
+    if (exec_sql(db, "BEGIN IMMEDIATE")) goto done;
+    if (sqlite3_prepare_v2(db, "INSERT INTO call_log(id,device,number,started_at,direction,call_idx) VALUES(?,?,?,?,?,?)", -1, &stmt, NULL) != SQLITE_OK) goto rollback;
+    if (sqlite3_bind_int64(stmt, 1, id) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, device, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 3, number ? number : "", -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 4, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 5, direction == CALL_LOG_INCOMING ? "incoming" : "outgoing", -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, 6, call_idx) != SQLITE_OK || sqlite3_step(stmt) != SQLITE_DONE) goto rollback;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (exec_sql(db, "COMMIT")) goto rollback;
+    rc = 0;
+    goto done;
+rollback:
+    if (stmt) sqlite3_finalize(stmt);
+    exec_sql(db, "ROLLBACK");
+done:
+    if (mutex) sqlite3_mutex_leave(mutex);
+    return rc;
+}
+
 /** Создать новое поколение входящего вызова при явном unsolicited событии. */
 int call_log_start_new_generation(sqlite3* db, const char* device, int call_idx, const char* number,
                                   const char* timestamp, char* call_id, size_t call_id_len)

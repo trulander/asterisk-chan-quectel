@@ -30,9 +30,11 @@
 #include <asterisk/logger.h>
 
 #include "smsdb.h"
+#include "mt_retry.h"
 
 #include "sms_tx.h"
 #include "call_log.h"
+#include "call_log_async.h"
 #include "sms_delete_state.h"
 #include "sms_multipart.h"
 #include "sms_incoming_schema.h"
@@ -97,10 +99,9 @@ DEFINE_SQL_STATEMENT(get_mt_queue,
 DEFINE_SQL_STATEMENT(set_mt_queue,
                      "UPDATE mt_queue SET state = ?, attempts = ?, next_retry_at = ?, last_result = ?, sent_at = ?, delivered_at = ? "
                      "WHERE mid = ?")
-DEFINE_SQL_STATEMENT(pick_mt_queue,
-                     "SELECT device, mid, from_num, msg, ts, state, attempts, next_retry_at, last_result, created_at, sent_at, delivered_at "
-                     "FROM mt_queue WHERE (state = 'new') OR (state = 'retrying' AND next_retry_at <= ? AND attempts < ?) "
-                     "ORDER BY created_at LIMIT 1")
+/* Общий запрос используется также SQLite-регрессией без Asterisk: due retry выбирается
+ * по retry_at и конечному attempts, а порядок created_at сохраняет FIFO доставки. */
+DEFINE_SQL_STATEMENT(pick_mt_queue, MT_RETRY_PICK_SQL)
 DEFINE_SQL_STATEMENT(list_mt_queue,
                      "SELECT device, mid, from_num, msg, ts, state, attempts, next_retry_at, last_result, created_at, sent_at, delivered_at "
                      "FROM mt_queue ORDER BY created_at DESC, ROWID DESC")
@@ -124,6 +125,7 @@ DEFINE_SQL_STATEMENT(list_mt_out,
 // src/sms_paging.c (a pure SQLite module shared with the unit test).
 
 static sqlite3* smsdb;
+static call_log_async_t* call_history_queue;
 
 static int set_ast_str(sqlite3_stmt* stmt, int colno, struct ast_str** str)
 {
@@ -469,21 +471,30 @@ static void call_timestamp(char* out, size_t len)
  */
 static int db_init()
 {
-    if (smsdb) {
-        return 0;
-    }
+    if (smsdb) return call_history_queue ? 0 : -1;
 
-    if (db_open() || db_create() || db_init_statements()) {
-        return -1;
-    }
+    if (db_open() || db_create() || db_init_statements()) return -1;
     if (call_log_schema_ensure(smsdb)) {
-        ast_log(LOG_ERROR, "smsdb: call journal schema unavailable; continuing existing SMS operation\n");
+        ast_log(LOG_ERROR, "smsdb: call journal schema unavailable; call history queue disabled\n");
         return 0;
     }
     char now[64];
     call_timestamp(now, sizeof(now));
     if (call_log_recover(smsdb, now)) {
         ast_log(LOG_ERROR, "smsdb: call journal recovery failed; continuing with per-call errors logged\n");
+    }
+
+    /* Startup-only read seeds explicit rowids before any event producer starts. The
+     * allocator includes sqlite_sequence so deleted AUTOINCREMENT IDs are never reused. */
+    sqlite3_int64 next_id = 0;
+    if (call_log_async_seed_id(smsdb, &next_id)) {
+        ast_log(LOG_ERROR, "smsdb: cannot seed asynchronous call ID allocator\n");
+        return -1;
+    }
+    call_history_queue = call_log_async_start(smsdb, next_id);
+    if (!call_history_queue) {
+        ast_log(LOG_ERROR, "smsdb: cannot start call history writer; call history enqueue disabled\n");
+        return -1;
     }
     return 0;
 }
@@ -1242,65 +1253,60 @@ static int bind_int_or_null(sqlite3_stmt* stmt, int colno, int val)
     return sqlite3_bind_int(stmt, colno, val);
 }
 
-/** Адаптировать начало вызова к общему smsdb connection и текущему UTC времени.
- * DB mutex защищает соединение; call_log_start выполняет собственную транзакцию.
+/** Быстро скопировать START в bounded RAM FIFO и вернуть reserved stable ID.
+ * SQLite не вызывается на критическом AT/state path; overflow/trylock error возвращается caller.
  */
 int smsdb_call_start(const char* device, int call_idx, int direction, const char* number, char* call_id, size_t call_id_len)
 {
     char started[64];
     call_timestamp(started, sizeof(started));
-    SCOPED_DB(smsdb);
-    return call_log_start(smsdb, device, call_idx, (call_log_direction_t)direction, number, started, call_id, call_id_len);
+    return call_log_async_start_call(call_history_queue, device, call_idx,
+                                     (call_log_direction_t)direction, number, started, 0,
+                                     call_id, call_id_len);
 }
 
-/** Сохранить отдельное поколение входящего по явному unsolicited-событию.
- * Использовать только если event-correlation helper обнаружил release barrier.
+/** Поставить новое incoming поколение, минуя RAM dedupe только для release successor.
+ * Возвращённый ID резервируется до DB writer и стабилен для последующих FIFO events.
  */
 int smsdb_call_start_new_generation(const char* device, int call_idx, const char* number, char* call_id, size_t call_id_len)
 {
     char started[64];
     call_timestamp(started, sizeof(started));
-    SCOPED_DB(smsdb);
-    return call_log_start_new_generation(smsdb, device, call_idx, number, started, call_id, call_id_len);
+    return call_log_async_start_call(call_history_queue, device, call_idx, CALL_LOG_INCOMING,
+                                     number, started, 1, call_id, call_id_len);
 }
 
-/** Передать подтверждённый ACTIVE event в durable журнал входящего звонка. */
+/** Поставить incoming ANSWER event после START; writer сохраняет FIFO порядок. */
 int smsdb_call_answer(const char* call_id)
 {
-    SCOPED_DB(smsdb);
-    return call_log_answer(smsdb, call_id);
+    return call_log_async_answer(call_history_queue, call_id);
 }
 
-/** Сохранить текущий CLCC индекс для корреляции без смены вечного ID. */
+/** Поставить CLCC index update по stable ID без обращения к SQLite. */
 int smsdb_call_set_index(const char* call_id, int call_idx)
 {
-    SCOPED_DB(smsdb);
-    return call_log_set_index(smsdb, call_id, call_idx);
+    return call_log_async_set_index(call_history_queue, call_id, call_idx);
 }
 
-/** Завершить вызов с UTC временем; missed row и очередь уведомления атомарны. */
+/** Поставить FINISH event; missed row и mt_queue вставляются атомарно writer-ом. */
 int smsdb_call_finish(const char* call_id, int answered)
 {
     char ended[64];
     call_timestamp(ended, sizeof(ended));
-    SCOPED_DB(smsdb);
-    return call_log_finish(smsdb, call_id, answered, ended);
+    return call_log_async_finish(call_history_queue, call_id, answered, ended);
 }
 
-/** Найти durable ID по временному индексу, если PBX-канал отсутствует. */
+/** Найти incoming ID в RAM active map при отсутствии PBX-канала; SQLite не читается. */
 int smsdb_call_active_id(const char* device, int call_idx, char* call_id, size_t call_id_len)
 {
-    SCOPED_DB(smsdb);
-    return call_log_active_id(smsdb, device, call_idx, call_id, call_id_len);
+    return call_log_async_active_id(call_history_queue, device, call_idx, call_id, call_id_len);
 }
 
-/** Подтвердить завершение только по свежему modem snapshot под smsdb connection lock. */
+/** Занятый snapshot не меняет историю; absent candidate ставит async FINISH event. */
 int smsdb_call_release_confirm(const char* call_id, int slot_present)
 {
-    char ended[64];
-    call_timestamp(ended, sizeof(ended));
-    SCOPED_DB(smsdb);
-    return call_log_release_confirm(smsdb, call_id, slot_present, ended);
+    if (slot_present) return 0;
+    return smsdb_call_finish(call_id, 0);
 }
 
 int smsdb_mt_put(const char* device, const char* mid, const char* from_num, const char* msg, const char* ts)
@@ -1717,6 +1723,8 @@ int smsdb_vacuum_into(const char* backup_file)
  */
 void smsdb_atexit()
 {
+    /* Stop/drain writer before statement and connection teardown; join is shutdown-only. */
+    call_log_async_stop(&call_history_queue);
     db_clean_statements();
     if (sqlite3_close(smsdb) == SQLITE_OK) {
         smsdb = NULL;

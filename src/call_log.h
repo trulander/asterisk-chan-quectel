@@ -48,6 +48,11 @@ int call_log_release_snapshot_retry(unsigned int* older_snapshots, unsigned int*
  */
 int call_log_start(sqlite3* db, const char* device, int call_idx, call_log_direction_t direction,
                    const char* number, const char* timestamp, char* call_id, size_t call_id_len);
+/** Только DB writer вставляет rowid, заранее зарезервированный producer-ом; id > 0 и уникален.
+ * Явный AUTOINCREMENT id сохраняет `call-<id>` correlation; SQL transaction держит mutex.
+ */
+int call_log_start_reserved(sqlite3* db, sqlite3_int64 id, const char* device, int call_idx,
+                            call_log_direction_t direction, const char* number, const char* timestamp);
 /** Записать новое поколение incoming несмотря на ещё открытую строку с тем же modem index.
  * Используется только для подтверждённого unsolicited incoming при ожидающем release;
  * обычный повторный CLCC должен оставаться дедуплицированным через call_log_start().

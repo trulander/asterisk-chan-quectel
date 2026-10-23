@@ -37,6 +37,8 @@
 #include "eventfd.h"
 #include "helpers.h" /* fd_write_all() */
 #include "mt_task.h"
+#include "mt_retry.h"
+#include "mt_from.h"
 #include "smsdb.h"
 #include "web_util.h"
 #include "web_incoming_parts.h"
@@ -119,49 +121,44 @@ static void mt_extract_domain(const char* sip_uri, char* domain, size_t len)
     }
 }
 
-/*!
- * \brief Compute the retry backoff delay in seconds for the given attempt count.
+/** Построить retry transition с настроенными пределами и случайным jitter.
+ * Время задаёт вызывающий callback; helper чистой политики проверяется отдельно,
+ * чтобы retry boundary не зависел от реальных часов в unit-тесте.
  */
-static int mt_backoff_seconds(int attempts)
+static int mt_retry_make_plan(int status_code, int attempts, int now, mt_retry_plan_t* plan)
 {
-    const int base  = CONF_GLOBAL(mt_retry_base);
-    const int maxd  = CONF_GLOBAL(mt_retry_max_delay);
-    const int shift = (attempts < 8) ? attempts : 8;
-
-    long delay = (long)base << shift; /* base * 2^min(attempts, 8) */
-    if (delay > maxd) {
-        delay = maxd;
-    }
-    delay += (long)(ast_random() % 11); /* jitter 0..10 */
-
-    return (int)delay;
+    return mt_retry_plan_response(status_code, attempts, now,
+                                  CONF_GLOBAL(mt_retry_max_attempts),
+                                  CONF_GLOBAL(mt_retry_base), CONF_GLOBAL(mt_retry_max_delay),
+                                  (int)(ast_random() % 11), plan);
 }
 
-/*!
- * \brief Record a failed delivery attempt: state=retrying with backoff.
+/** Сохранить локальную ошибку подготовки/отправки с тем же backoff, что SIP failure.
+ * Функция вызывается только MT retry thread; smsdb обновляет именно mt_queue row по MID.
  */
 static void mt_send_fail(const struct smsdb_mt_row* row, const char* reason)
 {
-    const long now  = time(NULL);
-    const int attempts = row->attempts + 1;
-    const int max_attempts = CONF_GLOBAL(mt_retry_max_attempts);
-
-    if (attempts >= max_attempts) {
-        ast_log(LOG_ERROR, "mt: MESSAGE mid=%s failed, max attempts (%d) reached (%s)\n",
-            row->mid, max_attempts, S_OR(reason, "?"));
-        smsdb_mt_set_result(row->mid, "retrying", attempts, 0, "max attempts reached", 0, 0);
+    mt_retry_plan_t plan;
+    const int now = (int)time(NULL);
+    if (mt_retry_make_plan(0, row->attempts, now, &plan)) {
+        ast_log(LOG_ERROR, "mt: cannot plan retry mid=%s\n", row->mid);
         return;
     }
-
-    const int this_delay = mt_backoff_seconds(attempts);
-    const int next_retry_at = (int)now + this_delay;
-    ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s send failed (%s) -> retrying, attempt %d/%d, next in ~%ds\n",
-        row->mid, S_OR(reason, "?"), attempts, max_attempts, this_delay);
-    smsdb_mt_set_result(row->mid, "retrying", attempts, next_retry_at, reason, 0, 0);
+    if (plan.action == MT_RETRY_ACTION_EXHAUSTED) {
+        ast_log(LOG_ERROR, "mt: MESSAGE mid=%s failed, max attempts (%d) reached (%s)\n",
+                row->mid, CONF_GLOBAL(mt_retry_max_attempts), S_OR(reason, "?"));
+        smsdb_mt_set_result(row->mid, plan.state, plan.attempts, 0, "max attempts reached", 0, 0);
+        return;
+    }
+    ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s send failed (%s) -> retrying, attempt %d/%d, next at %d\n",
+            row->mid, S_OR(reason, "?"), plan.attempts, CONF_GLOBAL(mt_retry_max_attempts), plan.next_retry_at);
+    smsdb_mt_set_result(row->mid, plan.state, plan.attempts, plan.next_retry_at, reason, 0, 0);
 }
 
-/*!
- * \brief Callback invoked when the MESSAGE transaction terminates.
+/** Завершить асинхронную SIP MESSAGE попытку и сохранить её MT result.
+ * token принадлежит ao2 transaction callback; PJSIP 408/transport error планирует
+ * retry в той же mt_queue row, provisional/202 оставляют очередь у Flexisip,
+ * terminal 2xx отмечает delivered. DB write выполняется вне AT/call state path.
  */
 static void mt_msg_response_callback(void* token, pjsip_event* e)
 {
@@ -193,50 +190,49 @@ static void mt_msg_response_callback(void* token, pjsip_event* e)
             break;
     }
 
-    if (status_code == 202) {
-        /* Flexisip accepted while the phone is offline (will hold the message) */
-        ast_copy_string(last_result, "202 accepted (queued)", sizeof(last_result));
+    mt_retry_plan_t plan;
+    if (mt_retry_make_plan(status_code, tok->attempts, (int)now, &plan)) {
+        ast_log(LOG_ERROR, "mt: cannot plan SIP result mid=%s status=%d\n", tok->mid, status_code);
+        ao2_ref(tok, -1);
+        __sync_sub_and_fetch(&mt_inflight, 1);
+        return;
+    }
+
+    if (plan.action == MT_RETRY_ACTION_QUEUED) {
+        /* 202/1xx означает, что Flexisip принял сообщение и хранит его для endpoint. */
+        if (status_code == 202) ast_copy_string(last_result, "202 accepted (queued)", sizeof(last_result));
+        else snprintf(last_result, sizeof(last_result), "%d provisional (queued)", status_code);
         queued = 1;
         ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> queued (%s)\n", tok->mid, last_result);
-    } else if (status_code >= 200 && status_code < 300) {
-        /* phone online, Flexisip forwarded and got a 2xx from the phone */
+    } else if (plan.action == MT_RETRY_ACTION_DELIVERED) {
         snprintf(last_result, sizeof(last_result), "%d delivered", status_code);
         delivered = 1;
         ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> delivered (SIP %d)\n", tok->mid, status_code);
-    } else if (status_code >= 100 && status_code < 200) {
-        /* 110 Push / provisional: phone offline, Flexisip keeps the message */
-        snprintf(last_result, sizeof(last_result), "%d provisional (queued)", status_code);
-        queued = 1;
-        ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> queued (%s)\n", tok->mid, last_result);
     } else {
-        /* 3xx/4xx/5xx/transport: schedule a retry with backoff */
-        const int attempts = tok->attempts + 1;
-        const int max_attempts = CONF_GLOBAL(mt_retry_max_attempts);
-        if (status_code) {
-            snprintf(last_result, sizeof(last_result), "SIP %d", status_code);
-        } else {
-            ast_copy_string(last_result, "transport error", sizeof(last_result));
-        }
-        if (attempts >= max_attempts) {
+        /* SIP failure, including PJSIP transaction timeout/408, remains retryable
+         * at next_retry_at; a later successful attempt changes the same MID to delivered. */
+        if (status_code) snprintf(last_result, sizeof(last_result), "SIP %d", status_code);
+        else ast_copy_string(last_result, "transport error", sizeof(last_result));
+        if (plan.action == MT_RETRY_ACTION_EXHAUSTED) {
             ast_log(LOG_ERROR, "mt: MESSAGE mid=%s max attempts (%d) reached (%s)\n",
-                tok->mid, max_attempts, last_result);
-            smsdb_mt_set_result(tok->mid, "retrying", attempts, 0, "max attempts reached", 0, 0);
-        } else {
-            const int this_delay = mt_backoff_seconds(attempts);
-            const int next_retry_at = (int)now + this_delay;
-            ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> retrying (attempt %d/%d, %s, next in ~%ds)\n",
-                tok->mid, attempts, max_attempts, last_result, this_delay);
-            smsdb_mt_set_result(tok->mid, "retrying", attempts, next_retry_at, last_result, 0, 0);
+                    tok->mid, CONF_GLOBAL(mt_retry_max_attempts), last_result);
+            smsdb_mt_set_result(tok->mid, plan.state, plan.attempts, 0, "max attempts reached", 0, 0);
+            ao2_ref(tok, -1);
+            __sync_sub_and_fetch(&mt_inflight, 1);
+            return;
         }
+        ast_log(LOG_NOTICE, "mt: MESSAGE mid=%s -> retrying (attempt %d/%d, %s, next at %d)\n",
+                tok->mid, plan.attempts, CONF_GLOBAL(mt_retry_max_attempts), last_result, plan.next_retry_at);
+        smsdb_mt_set_result(tok->mid, plan.state, plan.attempts, plan.next_retry_at, last_result, 0, 0);
         ao2_ref(tok, -1);
         __sync_sub_and_fetch(&mt_inflight, 1);
         return;
     }
 
     if (delivered) {
-        smsdb_mt_set_result(tok->mid, "delivered", tok->attempts, 0, last_result, (int)now, (int)now);
+        smsdb_mt_set_result(tok->mid, plan.state, tok->attempts, 0, last_result, (int)now, (int)now);
     } else if (queued) {
-        smsdb_mt_set_result(tok->mid, "queued", tok->attempts, 0, last_result, (int)now, 0);
+        smsdb_mt_set_result(tok->mid, plan.state, tok->attempts, 0, last_result, (int)now, 0);
     }
 
     ao2_ref(tok, -1);
@@ -366,11 +362,15 @@ static void mt_send_row(const struct smsdb_mt_row* row)
 
     ast_sip_update_to_uri(tdata, sip_to);
 
-    /* From: sip:<from_num>@<domain> */
+    /* ast_sip_update_from() принимает полную SIP URI либо user[@domain] и сам парсит
+     * её как PJSIP URI; сначала экранируем sender user-part, чтобы '@' из SMS From
+     * не превратился в разделитель user/host и не допускал header injection. */
     mt_extract_domain(sip_to, domain, sizeof(domain));
-    if (!ast_strlen_zero(cur.from_num) && !ast_strlen_zero(domain)) {
-        snprintf(from_buf, sizeof(from_buf), "sip:%s@%s", cur.from_num, domain);
-        ast_sip_update_from(tdata, from_buf);
+    if (mt_from_uri_build(cur.from_num, domain, from_buf, sizeof(from_buf)) ||
+        ast_sip_update_from(tdata, from_buf)) {
+        pjsip_tx_data_dec_ref(tdata);
+        mt_send_fail(&cur, "invalid MT From identity or domain");
+        return;
     }
 
     /* Stable Message-ID so retries of the same mid are de-duplicated. */
@@ -513,11 +513,15 @@ void mt_send_imdn_receipt(const char* device, const char* imdn_id, const char* t
 
     ast_sip_update_to_uri(tdata, sip_to);
 
-    /* From: sip:<gsm-number>@<domain> (the SMS recipient number is the sender of the receipt). */
+    /* From user-part is escaped by the same production URI builder as outbound SMS. */
     mt_extract_domain(sip_to, domain, sizeof(domain));
-    if (!ast_strlen_zero(to_gsm_node_hint) && !ast_strlen_zero(domain)) {
-        snprintf(from_buf, sizeof(from_buf), "sip:%s@%s", to_gsm_node_hint, domain);
-        ast_sip_update_from(tdata, from_buf);
+    if (!ast_strlen_zero(to_gsm_node_hint)) {
+        if (mt_from_uri_build(to_gsm_node_hint, domain, from_buf, sizeof(from_buf)) ||
+            ast_sip_update_from(tdata, from_buf)) {
+            ast_log(LOG_WARNING, "mt: IMDN receipt: invalid From identity or domain\n");
+            pjsip_tx_data_dec_ref(tdata);
+            return;
+        }
     }
 
     /* Unique Message-ID, disjoint from MT message ids. */

@@ -1601,10 +1601,11 @@ static void public_state_fini(struct public_state* const state)
 #endif
 
     mt_task_stop();
-    smsdb_atexit();
 
+    /* Сначала остановить producers модемов, затем drain call-history FIFO и закрыть SQLite. */
     dev_manager_stop(state);
     devices_destroy(state);
+    smsdb_atexit();
 
     eventfd_close(&state->dev_manager_event);
     AST_RWLIST_HEAD_DESTROY(&state->devices);

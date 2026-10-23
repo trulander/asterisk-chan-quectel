@@ -8,4 +8,12 @@
 int clcc_parse_line(char* line, unsigned* call_idx, unsigned* dir, unsigned* state, unsigned* mode,
                     unsigned* mpty, char** number, unsigned* toa);
 
+/** Разобрать строгий префикс CLCC для vendor release status 6.
+ * Принимает только индекс, направление, state=6, voice mode и mpty в допустимом
+ * диапазоне; поля номера намеренно не требуются, так как modem может оборвать их.
+ * Успех — 0 и заполненные identity поля; любая неоднозначность — -1.
+ */
+int clcc_parse_release_prefix(char* line, unsigned* call_idx, unsigned* dir, unsigned* mode,
+                              unsigned* mpty);
+
 #endif

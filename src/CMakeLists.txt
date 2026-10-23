@@ -24,6 +24,8 @@ set(SRC_FILES
     monitor_thread.c
     msg_tech.c
     mt_task.c
+    mt_retry.c
+    mt_from.c
     pcm.c
     pdu.c
     ringbuffer.c
@@ -38,6 +40,7 @@ set(SRC_FILES
     sms_tx.c
     # Журнал вызовов и атомарная постановка missed уведомлений в существующую MT очередь.
     call_log.c
+    call_log_async.c
     call_paging.c
     tty.c
     web_util.c

@@ -24,6 +24,7 @@
 #include "at_response.h"
 
 #include "at_parse.h"
+#include "clcc_parser.h"
 #include "at_queue.h"
 #include "at_read.h"
 #include "chan_quectel.h"
@@ -1233,23 +1234,28 @@ static void queue_pending_call_releases(struct pvt* pvt)
     }
 }
 
-/** Сохранить no-channel/CPVT release как кандидата до fresh CLCC snapshot.
- * Устойчивый ID копируется в pvt; index не используется для finish без snapshot.
+/** Сохранить release как кандидата до fresh CLCC snapshot.
+ * Stable ID используется для истории; если CPVT не получил ID из-за enqueue error,
+ * пустая корреляция всё ещё позволяет завершить сам channel по индексу и fresh snapshot.
  */
 static void defer_call_release(struct pvt* pvt, struct cpvt* cpvt, int call_idx, unsigned int dir)
 {
     char id[CALL_LOG_ID_LEN] = "";
     if (cpvt && cpvt->call_log_id[0]) {
         snprintf(id, sizeof(id), "%s", cpvt->call_log_id);
-    } else if (dir == CALL_DIR_INCOMING && smsdb_call_active_id(PVT_ID(pvt), call_idx, id, sizeof(id)) <= 0) {
+    } else if (!cpvt && dir == CALL_DIR_INCOMING) {
+        /* Без PBX channel stable ID можно взять только из RAM map. Если async
+         * START не удалось поставить, missed history теряется, но здесь нельзя
+         * подменять его другой active row или задерживать modem hangup. */
+        if (smsdb_call_active_id(PVT_ID(pvt), call_idx, id, sizeof(id)) <= 0) return;
+    } else if (!cpvt) {
         return;
     }
-    if (!id[0]) return;
 
     unsigned int slot = 32;
     for (unsigned int i = 0; i < 32; ++i) {
         if (pvt->call_release[i].active && pvt->call_release[i].call_idx == call_idx &&
-            strcmp(pvt->call_release[i].call_id, id) == 0) {
+            ((!id[0] && !pvt->call_release[i].call_id[0]) || strcmp(pvt->call_release[i].call_id, id) == 0)) {
             if (!pvt->call_release[i].verification_queued) queue_call_release_verification(pvt, i);
             return;
         }
@@ -1305,12 +1311,26 @@ static void complete_call_release_snapshot(struct pvt* pvt)
         }
         const int present = decision == CALL_LOG_SNAPSHOT_PRESENT;
         const int finish_release = call_log_release_should_finish(present, pvt->call_release[i].successor_id[0] != '\0');
-        const int finish_error = finish_release
-                                     ? smsdb_call_finish(pvt->call_release[i].call_id, 0)
-                                     : smsdb_call_release_confirm(pvt->call_release[i].call_id, 1);
+        const int finish_error = pvt->call_release[i].call_id[0]
+                                     ? (finish_release
+                                            ? smsdb_call_finish(pvt->call_release[i].call_id, 0)
+                                            : smsdb_call_release_confirm(pvt->call_release[i].call_id, 1))
+                                     : 0;
         if (finish_error) {
-            ast_log(LOG_ERROR, "[%s] Cannot commit call release verification idx:%d\n", PVT_ID(pvt), pvt->call_release[i].call_idx);
+            ast_log(LOG_ERROR, "[%s] Cannot enqueue call release history idx:%d; keeping candidate for retry\n",
+                    PVT_ID(pvt), pvt->call_release[i].call_idx);
             pvt->call_release[i].seen = 0;
+            /* История не может задержать подтверждённый modem hangup. Ошибка FIFO
+             * сохраняет candidate для следующего snapshot, но channel state меняется сейчас. */
+            if (!present) {
+                struct cpvt* cpvt = pvt_channel_find_by_call_idx(pvt, pvt->call_release[i].call_idx);
+                if (cpvt && strcmp(cpvt->call_log_id, pvt->call_release[i].call_id) == 0 && cpvt->state != CALL_STATE_RELEASED) {
+                    cpvt_change_state(cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_CLEARING);
+                }
+                pvt->ring = pvt->dialing = pvt->cwaiting = 0;
+            }
+            pvt->call_release[i].verification_queued = 0;
+            queue_call_release_verification(pvt, i);
             continue;
         }
         if (!present) {
@@ -1381,7 +1401,7 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
             call_log_incoming_generation_decide(origin, 1, event_state, release_slot >= 0, successor_slot >= 0);
         if (generation == CALL_LOG_GENERATION_NEW) {
             if (smsdb_call_start_new_generation(PVT_ID(pvt), (int)call_idx, number, incoming_call_id, sizeof(incoming_call_id))) {
-                ast_log(LOG_ERROR, "[%s] Cannot persist new incoming generation idx:%u\n", PVT_ID(pvt), call_idx);
+                ast_log(LOG_ERROR, "[%s] Cannot enqueue new incoming generation idx:%u\n", PVT_ID(pvt), call_idx);
                 incoming_call_id[0] = '\0';
             } else {
                 ast_copy_string(pvt->call_release[release_slot].successor_id, incoming_call_id,
@@ -1393,7 +1413,7 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
         } else if (generation == CALL_LOG_GENERATION_USE_SUCCESSOR) {
             ast_copy_string(incoming_call_id, pvt->call_release[successor_slot].successor_id, sizeof(incoming_call_id));
         } else if (smsdb_call_start(PVT_ID(pvt), (int)call_idx, CALL_LOG_INCOMING, number, incoming_call_id, sizeof(incoming_call_id))) {
-            ast_log(LOG_ERROR, "[%s] Cannot persist incoming call idx:%u\n", PVT_ID(pvt), call_idx);
+            ast_log(LOG_ERROR, "[%s] Cannot enqueue incoming call history idx:%u\n", PVT_ID(pvt), call_idx);
             incoming_call_id[0] = '\0';
         }
     }
@@ -1442,7 +1462,7 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
                     cpvt->call_idx = (short)call_idx;
                     if (CPVT_DIR_OUTGOING(cpvt) && cpvt->call_log_id[0]) {
                         if (smsdb_call_set_index(cpvt->call_log_id, (int)call_idx)) {
-                            ast_log(LOG_ERROR, "[%s] Cannot update outgoing call index %u\n", PVT_ID(pvt), call_idx);
+                            ast_log(LOG_ERROR, "[%s] Cannot enqueue outgoing call index %u\n", PVT_ID(pvt), call_idx);
                         }
                     }
                     process_state  = cpvt_change_state(cpvt, state, 0);
@@ -1473,7 +1493,7 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
                 char* id = incoming_call_id[0] ? incoming_call_id : (cpvt && cpvt->call_log_id[0] ? cpvt->call_log_id : incoming_call_id);
                 if (!id[0] && smsdb_call_active_id(PVT_ID(pvt), (int)call_idx, incoming_call_id, sizeof(incoming_call_id)) > 0) id = incoming_call_id;
                 if (id[0] && smsdb_call_answer(id)) {
-                    ast_log(LOG_ERROR, "[%s] Cannot persist answered call idx:%u\n", PVT_ID(pvt), call_idx);
+                    ast_log(LOG_ERROR, "[%s] Cannot enqueue answered call idx:%u\n", PVT_ID(pvt), call_idx);
                 }
             }
             if (cpvt && pvt->is_simcom && CONF_UNIQ(pvt, uac) == TRIBOOL_FALSE && pvt->has_voice) {
@@ -1610,8 +1630,17 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
         char* number;
 
         if (at_parse_clcc(ast_str_buffer(line), &call_idx, &dir, &state, &mode, &mpty, &number, &type)) {
+            unsigned release_idx, release_dir, release_mode, release_mpty;
             ast_log(LOG_ERROR, "[%s] CLCC - can't parse line '%s'\n", PVT_ID(pvt), ast_str_buffer(line));
             pvt->call_release_snapshot_invalid = 1;
+            /* Quectel state 6 означает RELEASED (как в документированном ^DSCI).
+             * Если номерная часть оборвана, сохранить только однозначный release identity;
+             * весь snapshot остаётся invalid и не может сам подтвердить отсутствие слота. */
+            if (!clcc_parse_release_prefix(ast_str_buffer(line), &release_idx, &release_dir,
+                                           &release_mode, &release_mpty)) {
+                handle_clcc(pvt, release_idx, release_dir, CALL_STATE_RELEASED, release_mode,
+                            release_mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, "", 0, CALL_LOG_EVENT_CLCC);
+            }
             continue;
         }
         if (!call_idx || dir > CALL_DIR_INCOMING || state > CALL_STATE_WAITING || mpty > 1 || mode > 2) {

@@ -104,6 +104,13 @@ target_link_libraries(ctq_call_log_test PRIVATE SQLite::SQLite3)
 target_compile_options(ctq_call_log_test PRIVATE -Wall -Wextra)
 add_test(NAME call-log COMMAND ctq_call_log_test)
 
+# Асинхронный журнал вызовов: FIFO, дедупликация, nonblocking при DB lock, overflow, ошибки и restart.
+add_executable(ctq_call_log_async_test call_log_async_test.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_log_async.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_log.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_multipart.c)
+target_include_directories(ctq_call_log_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_call_log_async_test PRIVATE SQLite::SQLite3 Threads::Threads)
+target_compile_options(ctq_call_log_async_test PRIVATE -Wall -Wextra)
+add_test(NAME call-log-async COMMAND ctq_call_log_async_test)
+
 # Call history production SQL pager: exact SIM, durable payload/order/pagination/error на in-memory SQLite.
 add_executable(ctq_call_paging_test call_paging_test.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_paging.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/call_log.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/sms_multipart.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/web_util.c)
 target_include_directories(ctq_call_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -134,6 +141,19 @@ target_include_directories(ctq_sim_metrics_test PRIVATE ${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(ctq_sim_metrics_test PRIVATE SQLite::SQLite3)
 target_compile_options(ctq_sim_metrics_test PRIVATE -Wall -Wextra)
 add_test(NAME sim-metrics COMMAND ctq_sim_metrics_test)
+
+# MT From: production URI builder экранирует sender identity и отклоняет пустые/опасные значения.
+add_executable(ctq_mt_from_test mt_from_test.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/mt_from.c)
+target_include_directories(ctq_mt_from_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_options(ctq_mt_from_test PRIVATE -Wall -Wextra)
+add_test(NAME mt-from COMMAND ctq_mt_from_test)
+
+# MT retry: production policy и общий SQL picker mt_queue; 400/error, restart, due-time и успешное завершение.
+add_executable(ctq_mt_retry_test mt_retry_test.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/mt_retry.c)
+target_include_directories(ctq_mt_retry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ctq_mt_retry_test PRIVATE SQLite::SQLite3)
+target_compile_options(ctq_mt_retry_test PRIVATE -Wall -Wextra)
+add_test(NAME mt-retry COMMAND ctq_mt_retry_test)
 
 # sms_tx: независимые SQLite transaction primitives src/sms_tx.[ch]. Проверяются nested-BEGIN,
 # параллельные begin/commit одного connection, failed COMMIT→ROLLBACK, failed BEGIN,

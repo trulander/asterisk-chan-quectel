@@ -218,8 +218,8 @@ static int get_at_clir_value(const int clir)
 }
 
 /** Начать исходящий GSM-вызов после проверки канала и устройства.
- * Сначала пытается сохранить журнал и продолжает исходное поведение набора при
- * ошибке БД; cpvt владеет ID до окончательного hangup, call_idx пока неизвестен.
+ * START только копируется в RAM FIFO; отказ очереди логируется, но не задерживает набор.
+ * cpvt владеет зарезервированным ID, modem call_idx пока неизвестен.
  */
 static int channel_call(struct ast_channel* channel, const char* dest, attribute_unused int timeout)
 {
@@ -273,7 +273,7 @@ static int channel_call(struct ast_channel* channel, const char* dest, attribute
 
     PVT_STAT(pvt, out_calls)++;
     if (smsdb_call_start(PVT_ID(pvt), -1, CALL_LOG_OUTGOING, dest_num, cpvt->call_log_id, sizeof(cpvt->call_log_id))) {
-        ast_log(LOG_ERROR, "[%s] Cannot persist outgoing call; continuing dial attempt\n", PVT_ID(pvt));
+        ast_log(LOG_ERROR, "[%s] Cannot enqueue outgoing call history; continuing dial attempt\n", PVT_ID(pvt));
         cpvt->call_log_id[0] = '\0';
     }
     if (at_enqueue_dial(cpvt, dest_num, clir)) {
@@ -302,7 +302,7 @@ static int channel_hangup(struct ast_channel* channel)
         const int need_hangup  = CPVT_TEST_FLAG(cpvt, CALL_FLAG_NEED_HANGUP) ? 1 : 0;
         const int hangup_cause = ast_channel_hangupcause(channel);
         if (cpvt->call_log_id[0] && smsdb_call_finish(cpvt->call_log_id, 0)) {
-            ast_log(LOG_ERROR, "[%s] Cannot persist call hangup idx:%d\n", PVT_ID(pvt), cpvt->call_idx);
+            ast_log(LOG_ERROR, "[%s] Cannot enqueue call hangup history idx:%d; continuing hangup\n", PVT_ID(pvt), cpvt->call_idx);
         }
 
         ast_debug(1, "[%s] Hanging up call - idx:%d cause:%d needed:%d\n", PVT_ID(pvt), cpvt->call_idx, hangup_cause, need_hangup);

@@ -89,3 +89,35 @@ int clcc_parse_line(char* line, unsigned* call_idx, unsigned* dir, unsigned* sta
     *toa = (unsigned)toa_value;
     return 0;
 }
+
+/** Принимать только однозначную identity-часть vendor CLCC release status.
+ * Номер может быть оборван после запятой/кавычки; он не влияет на выбор текущего
+ * call_idx, но текущий release всё равно требует следующего полного snapshot barrier.
+ */
+int clcc_parse_release_prefix(char* line, unsigned* call_idx, unsigned* dir, unsigned* mode,
+                              unsigned* mpty)
+{
+    if (!line || !call_idx || !dir || !mode || !mpty) return -1;
+
+    char* cursor = skip_spaces(line);
+    static const char prefix[] = "+CLCC:";
+    if (strncmp(cursor, prefix, sizeof(prefix) - 1) != 0) return -1;
+    cursor = skip_spaces(cursor + sizeof(prefix) - 1);
+
+    unsigned parsed_idx, parsed_dir, parsed_state, parsed_mode, parsed_mpty;
+    if (parse_uint_field(&cursor, ',', &parsed_idx) ||
+        parse_uint_field(&cursor, ',', &parsed_dir) ||
+        parse_uint_field(&cursor, ',', &parsed_state) ||
+        parse_uint_field(&cursor, ',', &parsed_mode) ||
+        parse_uint_field(&cursor, ',', &parsed_mpty)) return -1;
+
+    /* state 6 документирован драйвером для ^DSCI как CALL_STATE_RELEASED;
+     * не распространять это исключение на другие состояния или типы звонков. */
+    if (!parsed_idx || parsed_dir > 1u || parsed_state != 6u || parsed_mode != 0u || parsed_mpty > 1u) return -1;
+
+    *call_idx = parsed_idx;
+    *dir = parsed_dir;
+    *mode = parsed_mode;
+    *mpty = parsed_mpty;
+    return 0;
+}
