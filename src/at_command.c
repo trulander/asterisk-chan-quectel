@@ -1021,6 +1021,7 @@ int at_enqueue_list_messages(struct cpvt* cpvt, enum msg_status_t stat)
  * rowid обязан быть положительным, idx неотрицательным; второй параллельный verify запрещён.
  * Возвращает 0 только при queue acceptance после durable VERIFY_START; -1 при state/format/
  * enqueue error (state defer-ится, активная volatile correlation очищается).
+ */
 int at_enqueue_sms_delete_verify(struct cpvt* cpvt, long long rowid, int idx)
 {
     DECLARE_AT_CMDNT(cpms, "+CPMS=\"SM\",\"SM\",\"SM\"");
