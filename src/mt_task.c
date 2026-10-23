@@ -41,6 +41,7 @@
 #include "web_util.h"
 #include "web_incoming_parts.h"
 #include "web_sim_metrics.h"
+#include "web_at_command.h"
 
 // ================================================================
 
@@ -1797,18 +1798,74 @@ static void mt_web_calls(int fd, const char *sim, int page, int json)
     mt_web_send(fd, "200 OK", "text/html; charset=utf-8", ast_str_buffer(buf), ast_str_strlen(buf));
 }
 
-/** Разобрать один HTTP GET, dispatch legacy handlers без изменения и новый parts route.
- * fd принадлежит этой функции и закрывается в общем epilogue; query/path локальны.
- * Новый classifier вызывается только для incoming route family; SIM parser/existence
- * check предшествуют DB read, malformed/unknown device получает 404.
+/** Адаптировать socket recv к production HTTP reader с ограниченным ожиданием.
+ * \param ctx Указатель на fd принятого соединения; сокет принадлежит вызывающему.
+ * \param buffer Буфер назначения, предоставленный web_at_http_read.
+ * \param capacity Максимальное число запрашиваемых байт.
+ * \return Положительное число байт при чтении, -1 при timeout/ошибке.
+ */
+static ssize_t mt_web_at_socket_read(void *ctx, void *buffer, size_t capacity)
+{
+    int fd = *(int *)ctx;
+    int timeout_ms = 3000, exception = 0;
+    if (ast_waitfor_n_fd(&fd, 1, &timeout_ms, &exception) != fd) return -1;
+    return recv(fd, buffer, capacity, 0);
+}
+
+/** Проверить binding SIM по действующему списку устройств.
+ * \param ctx Неиспользуемый контекст callback.
+ * \param device NUL-терминированное имя из разобранной формы.
+ * \return Ненулевое значение при точном совпадении; не меняет состояние и не ставит команду.
+ */
+static int mt_web_at_device_check(void *ctx, const char *device)
+{
+    (void)ctx;
+    return mt_web_sim_exists(device);
+}
+
+/** Добавить в select одну опцию текущего настроенного устройства.
+ * \param ctx Указатель на ast_str ** формы; принадлежит вызывающей функции.
+ * \param snap Неизменяемый snapshot одного устройства на время callback.
+ * \return 0 для продолжения обхода; оба вывода имени проходят HTML escaping.
+ */
+static int mt_web_at_option(void *ctx, const struct pvt_status_snapshot *snap)
+{
+    struct ast_str **page = ctx;
+    ast_str_append(page, 0, "<option value=\"");
+    mt_html_escape(page, snap->name);
+    ast_str_append(page, 0, "\">");
+    mt_html_escape(page, snap->name);
+    ast_str_append(page, 0, "</option>");
+    return 0;
+}
+
+/** Передать проверенные device/command существующему AT enqueue API.
+ * \param ctx Неиспользуемый контекст callback.
+ * \param device Настроенное имя устройства, binding которого уже проверен.
+ * \param command Строка команды без CR/LF/NUL, подготовленная production parser.
+ * \return Результат send_at_command: 0 означает enqueue, отрицательное значение — ошибку.
+ * Функция не ожидает ответ модема и не выполняет прямого I/O с устройством.
+ */
+static int mt_web_at_enqueue(void *ctx, const char *device, const char *command)
+{
+    (void)ctx;
+    return send_at_command(device, command);
+}
+
+/** Обслужить один запрос mini-web через существующий listener.
+ * \param client_fd Принятый socket; функция закрывает его на каждом выходе. Ограниченный reader
+ * накапливает заголовки/тело; GET /at строит только форму, POST допускает enqueue после
+ * проверки framing, MIME, полей и выбранного SIM. Прочие legacy dispatch ветви сохранены.
+ * HTTP сообщает только enqueue/error: фактический ответ AT асинхронен и не коррелируется
+ * с socket-запросом; синтаксические ошибки не доходят до send_at_command().
  */
 static void mt_web_serve_client(int client_fd)
 {
-    char req[2048];
+    char req[4096];
     char method[16] = "";
     char path[512]  = "";
     char* query = NULL;
-    ssize_t n;
+    web_at_http_request parsed_request;
     int ms  = 3000;
     int exception = 0;
     int incoming_json = 0;
@@ -1820,16 +1877,14 @@ static void mt_web_serve_client(int client_fd)
         close(client_fd);
         return;
     }
-    n = recv(client_fd, req, sizeof(req) - 1, 0);
-    if (n <= 0) {
+    if (web_at_http_read(mt_web_at_socket_read, &client_fd, req, sizeof(req), &parsed_request)) {
+        mt_web_send(client_fd, "400 Bad Request", "text/plain", "malformed request", 17);
         close(client_fd);
         return;
     }
-    req[n] = '\0';
-
     char* end = strstr(req, "\r\n");
     if (!end) {
-        end = memchr(req, '\n', n);
+        end = memchr(req, '\n', parsed_request.header_len);
     }
     if (end) {
         *end = '\0';
@@ -1849,7 +1904,37 @@ static void mt_web_serve_client(int client_fd)
     }
 
     incoming_route = web_incoming_route(path, &incoming_tail, &incoming_json);
-    if (strcasecmp(method, "GET") != 0) {
+    /* GET намеренно отображает только форму: никакой AT pipeline отсюда не вызывается. */
+    if (!strcmp(path, "/at") && strcasecmp(method, "GET") == 0) {
+        RAII_VAR(struct ast_str *, options, ast_str_create(1024), ast_free);
+        web_at_response response;
+        if (!options || pvt_status_each(&options, mt_web_at_option) ||
+            web_at_response_build(WEB_AT_RESPONSE_FORM, NULL, NULL, ast_str_buffer(options), &response))
+            mt_web_send(client_fd, "500 Internal Server Error", "text/plain", "internal error", 14);
+        else mt_web_send(client_fd, response.status, response.content_type, response.body, (int)response.body_len);
+    /* Только явный POST может пройти validation и вызвать один submit adapter. */
+    } else if (!strcmp(path, "/at") && strcasecmp(method, "POST") == 0) {
+        web_at_form form;
+        const char *body = req + parsed_request.header_len;
+        int submitted = -1;
+        if (parsed_request.has_content_type && parsed_request.body_len > 0)
+            submitted = web_at_submit(body, parsed_request.body_len, &form, mt_web_at_device_check, mt_web_at_enqueue, NULL);
+        if (submitted == -1) {
+            web_at_response response;
+            if (web_at_response_build(WEB_AT_RESPONSE_BAD_REQUEST, NULL, NULL, NULL, &response))
+                mt_web_send(client_fd, "500 Internal Server Error", "text/plain", "internal error", 14);
+            else mt_web_send(client_fd, response.status, response.content_type, response.body, (int)response.body_len);
+        } else if (submitted == -2) {
+            mt_web_send(client_fd, "400 Bad Request", "text/plain", "invalid SIM/device", 18);
+        } else {
+            int queued = submitted == 0;
+            web_at_response response;
+            if (web_at_response_build(queued ? WEB_AT_RESPONSE_QUEUED : WEB_AT_RESPONSE_ERROR,
+                                      form.device, form.command, NULL, &response))
+                mt_web_send(client_fd, "500 Internal Server Error", "text/plain", "internal error", 14);
+            else mt_web_send(client_fd, response.status, response.content_type, response.body, (int)response.body_len);
+        }
+    } else if (strcasecmp(method, "GET") != 0) {
         mt_web_send(client_fd, "405 Method Not Allowed", "text/plain", "method not allowed", 19);
     } else if (!strcmp(path, "/json")) {
         /* legacy SMS JSON: mt_queue + mt_out, contract unchanged */

@@ -43,6 +43,8 @@ set(SRC_FILES
     web_util.c
     # Чистые route/escaping/response helpers, используемые production и CTest.
     web_incoming_parts.c
+    # HTTP framing, AT submit и response helpers; production используются mini-web handler.
+    web_at_command.c
     sim_metrics.c
     web_sim_metrics.c
 )

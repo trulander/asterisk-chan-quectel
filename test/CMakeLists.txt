@@ -39,6 +39,12 @@ target_include_directories(ctq_web_incoming_parts_test PRIVATE ${CMAKE_CURRENT_S
 target_compile_options(ctq_web_incoming_parts_test PRIVATE -Wall -Wextra)
 add_test(NAME web-incoming-parts COMMAND ctq_web_incoming_parts_test)
 
+# AT mini-web: production-used разборщик, HTTP reader, сборщик ответа и submit seam; проверки framing, escaping и ошибок.
+add_executable(ctq_web_at_command_test web_at_command_test.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/web_at_command.c)
+target_include_directories(ctq_web_at_command_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_options(ctq_web_at_command_test PRIVATE -Wall -Wextra)
+add_test(NAME web-at-command COMMAND ctq_web_at_command_test)
+
 # sms_multipart: production SQLite helper из smsdb_put(); out-of-order assembly/queue на in-memory DB.
 # Multipart/schema regression: migration, rowid/source identity, 1,3,2 assembly и COMMIT failure.
 add_executable(ctq_sms_multipart_test
