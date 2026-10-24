@@ -1489,12 +1489,23 @@ static void handle_clcc(struct pvt* const pvt, const unsigned int call_idx, cons
 
     switch (state) {
         case CALL_STATE_ACTIVE: {
-            if (dir == CALL_DIR_INCOMING) {
-                char* id = incoming_call_id[0] ? incoming_call_id : (cpvt && cpvt->call_log_id[0] ? cpvt->call_log_id : incoming_call_id);
-                if (!id[0] && smsdb_call_active_id(PVT_ID(pvt), (int)call_idx, incoming_call_id, sizeof(incoming_call_id)) > 0) id = incoming_call_id;
-                if (id[0] && smsdb_call_answer(id)) {
-                    ast_log(LOG_ERROR, "[%s] Cannot enqueue answered call idx:%u\n", PVT_ID(pvt), call_idx);
+            /* ACTIVE для канала коррелируется исключительно его устойчивым ID.
+             * В частности, исходящий не ищется по modem index или номеру: индекс
+             * может быть повторно назначен другому вызову. Incoming без cpvt
+             * сохраняет прежний stable-ID lookup для GSM-вызова без PBX-канала. */
+            const char* answered_id = NULL;
+            if (cpvt && cpvt->call_log_id[0]) {
+                answered_id = cpvt->call_log_id;
+            } else if (dir == CALL_DIR_INCOMING) {
+                if (incoming_call_id[0]) {
+                    answered_id = incoming_call_id;
+                } else if (smsdb_call_active_id(PVT_ID(pvt), (int)call_idx, incoming_call_id,
+                                                sizeof(incoming_call_id)) > 0) {
+                    answered_id = incoming_call_id;
                 }
+            }
+            if (answered_id && smsdb_call_answer(answered_id)) {
+                ast_log(LOG_ERROR, "[%s] Cannot enqueue answered call idx:%u\n", PVT_ID(pvt), call_idx);
             }
             if (cpvt && pvt->is_simcom && CONF_UNIQ(pvt, uac) == TRIBOOL_FALSE && pvt->has_voice) {
                 at_enqueue_cpcmreg(cpvt, 1);
@@ -1603,8 +1614,10 @@ static const char* next_line(const char* const str)
 
 /** Разобрать все строки AT+CLCC и отметить занятые индексы для pending release.
  * pvt защищён taskprocessor lock; response принадлежит текущему AT событию.
- * Ошибочные строки пропускаются, а отсутствие подтверждается только позже на OK.
- * Возвращает 0 по существующему response contract; DB здесь не меняется.
+ * Строгий parser имеет узкий fallback для допустимого обрезанного state=6: он
+ * предупреждается и передаёт release handler, но любая такая строка всё равно
+ * инвалидирует snapshot. Нераспознанный fallback логируется ERROR; отсутствие
+ * подтверждается только последующим свежим валидным barrier. DB здесь не меняется.
  */
 static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const response)
 {
@@ -1631,13 +1644,16 @@ static int at_response_clcc(struct pvt* const pvt, const struct ast_str* const r
 
         if (at_parse_clcc(ast_str_buffer(line), &call_idx, &dir, &state, &mode, &mpty, &number, &type)) {
             unsigned release_idx, release_dir, release_mode, release_mpty;
-            ast_log(LOG_ERROR, "[%s] CLCC - can't parse line '%s'\n", PVT_ID(pvt), ast_str_buffer(line));
-            pvt->call_release_snapshot_invalid = 1;
             /* Quectel state 6 означает RELEASED (как в документированном ^DSCI).
              * Если номерная часть оборвана, сохранить только однозначный release identity;
              * весь snapshot остаётся invalid и не может сам подтвердить отсутствие слота. */
-            if (!clcc_parse_release_prefix(ast_str_buffer(line), &release_idx, &release_dir,
-                                           &release_mode, &release_mpty)) {
+            const int release_result = clcc_parse_release_prefix(ast_str_buffer(line), &release_idx, &release_dir,
+                                                                  &release_mode, &release_mpty);
+            pvt->call_release_snapshot_invalid = 1;
+            if (clcc_parse_failure_is_error(release_result)) {
+                ast_log(LOG_ERROR, "[%s] CLCC - can't parse line '%s'\n", PVT_ID(pvt), ast_str_buffer(line));
+            } else {
+                ast_log(LOG_WARNING, "[%s] CLCC - partial RELEASED state=6 line '%s'\n", PVT_ID(pvt), ast_str_buffer(line));
                 handle_clcc(pvt, release_idx, release_dir, CALL_STATE_RELEASED, release_mode,
                             release_mpty ? TRIBOOL_TRUE : TRIBOOL_FALSE, "", 0, CALL_LOG_EVENT_CLCC);
             }

@@ -58,6 +58,47 @@ static void test_directions_and_idempotent_missed(void)
     sqlite3_close(db);
 }
 
+/** Проверить ACTIVE по точным stable IDs для incoming/outgoing без cross-update.
+ * Две SIM и одинаковые номера/повторно используемый modem index создают независимые
+ * строки; повторный ACTIVE идемпотентен, а unanswered outgoing не становится missed.
+ */
+static void test_answer_updates_only_exact_open_stable_id(void)
+{
+    sqlite3* db = test_db();
+    char incoming[CALL_LOG_ID_LEN], outgoing[CALL_LOG_ID_LEN], unanswered[CALL_LOG_ID_LEN];
+    sqlite3_stmt* st = NULL;
+    assert(call_log_start(db, "sim1", 4, CALL_LOG_INCOMING, "+700", "incoming", incoming, sizeof(incoming)) == 0);
+    assert(call_log_start(db, "sim2", 4, CALL_LOG_OUTGOING, "+700", "outgoing", outgoing, sizeof(outgoing)) == 0);
+    assert(call_log_start(db, "sim2", 5, CALL_LOG_OUTGOING, "+701", "unanswered", unanswered, sizeof(unanswered)) == 0);
+    char malformed_id[CALL_LOG_ID_LEN + 8];
+    snprintf(malformed_id, sizeof(malformed_id), "%sjunk", outgoing);
+    assert(call_log_answer(db, malformed_id) == -1);
+    assert(call_log_answer(db, outgoing) == 0);
+    assert(call_log_answer(db, outgoing) == 0);
+    assert(call_log_answer(db, incoming) == 0);
+    assert(call_log_finish(db, outgoing, 0, "end outgoing") == 0);
+    assert(call_log_finish(db, unanswered, 0, "end unanswered") == 0);
+    assert(sqlite3_prepare_v2(db, "SELECT direction,answered,finished FROM call_log WHERE id=CAST(substr(?1,6) AS INTEGER)", -1, &st, NULL) == SQLITE_OK);
+    sqlite3_bind_text(st, 1, outgoing, -1, SQLITE_TRANSIENT);
+    assert(sqlite3_step(st) == SQLITE_ROW && strcmp((const char*)sqlite3_column_text(st, 0), "outgoing") == 0);
+    assert(sqlite3_column_int(st, 1) == 1 && sqlite3_column_int(st, 2) == 1);
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(db, "SELECT direction,answered,finished FROM call_log WHERE id=CAST(substr(?1,6) AS INTEGER)", -1, &st, NULL) == SQLITE_OK);
+    sqlite3_bind_text(st, 1, incoming, -1, SQLITE_TRANSIENT);
+    assert(sqlite3_step(st) == SQLITE_ROW && strcmp((const char*)sqlite3_column_text(st, 0), "incoming") == 0);
+    assert(sqlite3_column_int(st, 1) == 1 && sqlite3_column_int(st, 2) == 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(db, "SELECT direction,answered FROM call_log WHERE id=CAST(substr(?1,6) AS INTEGER)", -1, &st, NULL) == SQLITE_OK);
+    sqlite3_bind_text(st, 1, unanswered, -1, SQLITE_TRANSIENT);
+    assert(sqlite3_step(st) == SQLITE_ROW && strcmp((const char*)sqlite3_column_text(st, 0), "outgoing") == 0);
+    assert(sqlite3_column_int(st, 1) == 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(db, "SELECT count(*) FROM mt_queue", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
 /** Сценарий: несовпадающее направление отбрасывается до durable start.
  * Существующая outgoing row занимает cpvt; incoming event с тем же индексом не должен
  * создать phantom incoming или пропущенное уведомление при восстановлении.
@@ -329,6 +370,7 @@ static void test_restart_and_queue_failure_rollback(void)
 int main(void)
 {
     test_directions_and_idempotent_missed();
+    test_answer_updates_only_exact_open_stable_id();
     test_direction_mismatch_has_no_phantom_row();
     test_late_release_does_not_finish_reused_slot();
     test_active_first_unsolicited_generation_before_snapshot();

@@ -224,16 +224,21 @@ int call_log_active_id(sqlite3* db, const char* device, int call_idx, char* call
     return step == SQLITE_DONE ? 0 : -1;
 }
 
-/** Зафиксировать ответ только для ещё открытого вызова по устойчивому ID.
- * UPDATE не создаёт строк и не влияет на другие звонки при повторном событии.
+/** Зафиксировать подтверждённый ACTIVE для любого ещё открытого вызова.
+ * Идентификатор обязан быть `call-<rowid>` из incoming stable-ID flow либо из
+ * `cpvt->call_log_id` исходящего канала. Одно UPDATE адресует только эту строку;
+ * повторный ACTIVE идемпотентен, завершённая строка не меняется. Направление не
+ * переписывается: исходящий остаётся outgoing, а missed определяется только при
+ * finish unanswered incoming. Соединение и его mutex принадлежат вызывающему.
  */
 int call_log_answer(sqlite3* db, const char* call_id)
 {
     if (!db || !call_id) return -1;
     long long id = 0;
-    if (sscanf(call_id, "call-%lld", &id) != 1 || id <= 0) return -1;
+    char trailing = '\0';
+    if (sscanf(call_id, "call-%lld%c", &id, &trailing) != 1 || id <= 0) return -1;
     sqlite3_stmt* stmt = NULL;
-    if (sqlite3_prepare_v2(db, "UPDATE call_log SET answered=1 WHERE id=? AND finished=0 AND direction='incoming'", -1, &stmt, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(db, "UPDATE call_log SET answered=1 WHERE id=? AND finished=0", -1, &stmt, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_int64(stmt, 1, id);
     int ok = sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);

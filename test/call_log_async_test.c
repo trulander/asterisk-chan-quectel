@@ -88,6 +88,44 @@ static void test_fifo_dedupe_answer_missed_and_restart(void)
     unlink(path);
 }
 
+/** Проверить ACTIVE-переходы обоих направлений через production FIFO по ID, выданным START.
+ * Incoming и outgoing используют повторно один modem call_idx и одинаковый номер, но
+ * получают разные stable IDs; ANSWER, повторный ANSWER и FINISH проходят через async
+ * writer. Ожидаются две раздельные answered-строки, сохранённое outgoing direction и
+ * отсутствие missed/MT row для завершённого исходящего.
+ */
+static void test_exact_stable_id_answer_for_incoming_and_outgoing(void)
+{
+    sqlite3* db = open_db(":memory:");
+    call_log_async_t* q = call_log_async_start(db, 1);
+    assert(q);
+    char incoming[CALL_LOG_ID_LEN], outgoing[CALL_LOG_ID_LEN];
+    assert(call_log_async_start_call(q, "sim1", 4, CALL_LOG_INCOMING, "+700", "incoming", 0,
+                                     incoming, sizeof(incoming)) == 0);
+    assert(call_log_async_flush(q) == 0);
+    assert(call_log_async_start_call(q, "sim2", 4, CALL_LOG_OUTGOING, "+700", "outgoing", 0,
+                                     outgoing, sizeof(outgoing)) == 0);
+    assert(strcmp(incoming, outgoing) != 0);
+    assert(call_log_async_answer(q, outgoing) == 0);
+    assert(call_log_async_answer(q, incoming) == 0);
+    assert(call_log_async_answer(q, outgoing) == 0);
+    assert(call_log_async_finish(q, outgoing, 0, "outgoing end") == 0);
+    assert(call_log_async_finish(q, incoming, 0, "incoming end") == 0);
+    assert(call_log_async_flush(q) == 0);
+    assert_call(db, outgoing, "outgoing", 1, 1);
+    assert_call(db, incoming, "incoming", 1, 1);
+
+    sqlite3_stmt* stmt = NULL;
+    assert(sqlite3_prepare_v2(db, "SELECT count(*) FROM call_log WHERE answered=1", -1, &stmt, NULL) == SQLITE_OK);
+    assert(sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 2);
+    sqlite3_finalize(stmt);
+    assert(sqlite3_prepare_v2(db, "SELECT count(*) FROM mt_queue", -1, &stmt, NULL) == SQLITE_OK);
+    assert(sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0);
+    sqlite3_finalize(stmt);
+    call_log_async_stop(&q);
+    sqlite3_close(db);
+}
+
 /** Проверить быстрый enqueue при заблокированной SQLite и bounded queue failure policy.
  * Main thread держит connection mutex, поэтому writer не может выполнить DB insert;
  * producers должны возвращать быстро, а очередь отказывает без ожидания после заполнения/trylock.
@@ -414,6 +452,7 @@ int main(int argc, char** argv)
         return 0;
     }
     test_fifo_dedupe_answer_missed_and_restart();
+    test_exact_stable_id_answer_for_incoming_and_outgoing();
     test_locked_database_nonblocking_and_overflow();
     test_finish_enqueue_overflow_keeps_active_call();
     test_concurrent_producers_are_serialized();

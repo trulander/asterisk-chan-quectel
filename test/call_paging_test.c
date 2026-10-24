@@ -173,6 +173,89 @@ static void test_schema_and_step_errors(void)
     sqlite3_close(db);
 }
 
+/** Проверить production UTC Duration для обычного, нулевого и недоступного интервала.
+ * Включены отсутствующая/обратная дата, невозможный календарный день, чрезмерная
+ * временная область и короткий output; ни один некорректный вход не должен дать
+ * правдоподобную выдуманную длительность.
+ */
+static void test_duration_positive_zero_and_invalid_boundaries(void)
+{
+    char duration[64];
+    assert(call_paging_duration("2025-01-01 00:00:00 UTC", "2025-01-01 01:02:03 UTC", duration, sizeof(duration)) == 0);
+    assert(strcmp(duration, "0д 01:02:03") == 0);
+    assert(call_paging_duration("2024-02-29 12:00:00 UTC", "2024-02-29 12:00:00 UTC", duration, sizeof(duration)) == 0);
+    assert(strcmp(duration, "0д 00:00:00") == 0);
+    assert(call_paging_duration("2025-01-01 23:59:59 UTC", "2025-01-03 00:00:01 UTC", duration, sizeof(duration)) == 0);
+    assert(strcmp(duration, "1д 00:00:02") == 0);
+    assert(call_paging_duration("2025-01-01 00:00:00 UTC", NULL, duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-02-30 00:00:00 UTC", "2025-03-01 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01 00:00:00 UTC", "2025-02-30 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-02 00:00:00 UTC", "2025-01-01 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("99999-01-01 00:00:00 UTC", "99999-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("0000-01-01 00:00:00 UTC", "9999-12-31 23:59:59 UTC", duration, sizeof(duration)) == 0);
+    assert(strcmp(duration, "3652424д 23:59:59") == 0);
+    assert(call_paging_duration("2025-01-01 00:00:00 UTC", "2025-01-01 00:00:01 UTC", duration, 2) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01", "2025-01-02", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    /* Точный формат отклоняет пробелы и табуляцию в каждой фиксированной numeric position;
+     * это предотвращает permissive parsing scanf и не принимает повреждённое время. */
+    assert(call_paging_duration(" 025-01-01 00:00:00 UTC", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025- 1-01 00:00:00 UTC", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01 0 0:00:00 UTC", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01 00:\t0:00 UTC", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01 00:00:00 UTC ", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01 00:00:00 GMT", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01 00:00:00 UTCX", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-1-01 00:00:00 UTC", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("2025-01-01 00:00:00", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    assert(call_paging_duration("２０２５-01-01 00:00:00 UTC", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    const char* malformed_whitespace[] = {
+        "202 5-01-01 00:00:00 UTC", "2025- 1-01 00:00:00 UTC", "2025-01- 1 00:00:00 UTC",
+        "2025-01-01  0:00:00 UTC", "2025-01-01 00: 0:00 UTC", "2025-01-01 00:00: 0 UTC",
+        "2025-01-01 00:00:0  UTC", "2025-01-01\t00:00:00 UTC", "2025-01-01 00:00:00\tUTC"
+    };
+    for (size_t i = 0; i < sizeof(malformed_whitespace) / sizeof(malformed_whitespace[0]); ++i) {
+        assert(call_paging_duration(malformed_whitespace[i], "2025-01-02 00:00:00 UTC",
+                                    duration, sizeof(duration)) == -1 && duration[0] == '\0');
+    }
+    assert(call_paging_duration("2025-01-01 00:00:60 UTC", "2025-01-02 00:00:00 UTC", duration, sizeof(duration)) == -1 && duration[0] == '\0');
+}
+
+/** Проверить точную разметку Duration header/cell через тот же production seam, который вызывает mt_call_html_row.
+ * Проверяются валидная и нулевая длительности, а также marker для отсутствующей/ошибочной даты;
+ * это предотвращает расхождение вычислителя с видимым HTML-контрактом.
+ */
+static void test_html_duration_fragment_contract(void)
+{
+    char fragment[64];
+    assert(call_paging_html_duration_fragment(1, NULL, NULL, fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<th>Duration</th>") == 0);
+    assert(call_paging_html_duration_fragment(0, "2025-01-01 00:00:00 UTC",
+                                               "2025-01-01 01:02:03 UTC", fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>0д 01:02:03</td>") == 0);
+    assert(call_paging_html_duration_fragment(0, "2025-01-01 00:00:00 UTC",
+                                               "2025-01-01 00:00:00 UTC", fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>0д 00:00:00</td>") == 0);
+    assert(call_paging_html_duration_fragment(0, "2025-01-01 23:59:59 UTC",
+                                               "2025-01-03 00:00:01 UTC", fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>1д 00:00:02</td>") == 0);
+    assert(call_paging_html_duration_fragment(0, "2025-01-01 00:00:00 UTC", NULL,
+                                               fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>&mdash;</td>") == 0);
+    assert(call_paging_html_duration_fragment(0, "2025-01-01 00:00:00 UTC",
+                                               "2025-02-30 00:00:00 UTC", fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>&mdash;</td>") == 0);
+    assert(call_paging_html_duration_fragment(0, "2025-01-02 00:00:00 UTC",
+                                               "2025-01-01 00:00:00 UTC", fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>&mdash;</td>") == 0);
+    assert(call_paging_html_duration_fragment(0, " 025-01-01 00:00:00 UTC",
+                                               "2025-01-02 00:00:00 UTC", fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>&mdash;</td>") == 0);
+    assert(call_paging_html_duration_fragment(0, "0000-01-01 00:00:00 UTC",
+                                               "9999-12-31 23:59:59 UTC", fragment, sizeof(fragment)) == 0);
+    assert(strcmp(fragment, "<td>3652424д 23:59:59</td>") == 0);
+    assert(call_paging_html_duration_fragment(1, NULL, NULL, fragment, 4) == -1 && fragment[0] == '\0');
+}
+
 /** Контракт production error body: проверяется точный общий literal и его byte length, чтобы truncation/сдвиг HTTP Content-Length не скрывался отдельной копией константы. */
 static void test_json_error_body_contract(void)
 {
@@ -186,6 +269,8 @@ static void test_json_error_body_contract(void)
 int main(void)
 {
     test_json_error_body_contract();
+    test_duration_positive_zero_and_invalid_boundaries();
+    test_html_duration_fragment_contract();
     test_exact_device_and_full_payload();
     test_order_page_boundaries_and_counts();
     test_page_meta_clamping_and_invalid_args();

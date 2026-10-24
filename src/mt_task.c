@@ -1722,8 +1722,10 @@ static int mt_call_json_row(void *opaque, const struct call_page_row *row)
     return 1;
 }
 
-/** Render one persisted row to HTML, HTML-escaping every DB-originated cell.
- * The SIM identifier is route-validated to [A-Za-z0-9_.-] before it is used in path links.
+/** Render one persisted row to HTML, экранируя каждую ячейку из БД.
+ * Duration вычисляется только из точных UTC start/end через production helper;
+ * при NULL/ошибке выводится явная пустая отметка. JSON renderer и его schema не меняются.
+ * Идентификатор SIM заранее ограничен маршрутом символами [A-Za-z0-9_.-].
  */
 static int mt_call_html_row(void *opaque, const struct call_page_row *row)
 {
@@ -1737,7 +1739,12 @@ static int mt_call_html_row(void *opaque, const struct call_page_row *row)
     ast_str_append(buf, 0, "</td><td>"); mt_html_escape(buf, row->direction);
     ast_str_append(buf, 0, "</td><td>%s</td><td>%s</td><td>", row->answered ? "yes" : "no", row->finished ? "yes" : "no");
     if (!ast_strlen_zero(row->ended_at)) mt_html_escape(buf, row->ended_at); else ast_str_append(buf, 0, "&mdash;");
-    ast_str_append(buf, 0, "</td></tr>");
+    char duration_cell[64];
+    if (call_paging_html_duration_fragment(0, row->started_at, row->ended_at,
+                                           duration_cell, sizeof(duration_cell))) {
+        ast_copy_string(duration_cell, "<td>&mdash;</td>", sizeof(duration_cell));
+    }
+    ast_str_append(buf, 0, "</td>%s</tr>", duration_cell);
     return 0;
 }
 
@@ -1790,7 +1797,12 @@ static void mt_web_calls(int fd, const char *sim, int page, int json)
     mt_web_html_head(&buf, "Call history"); mt_web_nav(&buf);
     ast_str_append(&buf, 0, "<h1>Call history for SIM "); mt_html_escape(&buf, sim);
     ast_str_append(&buf, 0, "</h1><p><a href=\""); mt_html_escape(&buf, base);
-    ast_str_append(&buf, 0, ".json?page=%d\">JSON</a></p><table><tr><th>ID</th><th>Number</th><th>Started (UTC)</th><th>Direction/type</th><th>Answered</th><th>Finished</th><th>Ended at (UTC)</th></tr>", page);
+    ast_str_append(&buf, 0, ".json?page=%d\">JSON</a></p><table><tr><th>ID</th><th>Number</th><th>Started (UTC)</th><th>Direction/type</th><th>Answered</th><th>Finished</th><th>Ended at (UTC)</th>", page);
+    char duration_header[64];
+    if (call_paging_html_duration_fragment(1, NULL, NULL, duration_header, sizeof(duration_header))) {
+        ast_copy_string(duration_header, "<th>Duration</th>", sizeof(duration_header));
+    }
+    ast_str_append(&buf, 0, "%s</tr>", duration_header);
     struct call_render_ctx ctx = { &buf, NULL, 0 };
     if (smsdb_call_page(sim, MT_WEB_CALL_PAGE_SIZE, offset, &ctx, mt_call_html_row)) {
         mt_web_db_error(fd, "Call history read", "text/plain", "call database unavailable", sizeof("call database unavailable") - 1); return;

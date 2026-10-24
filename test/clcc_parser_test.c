@@ -52,8 +52,16 @@ static void test_strict_clcc_field_parsing(void)
 static void test_partial_release_prefix_for_both_directions(void)
 {
     unsigned idx = 0, dir = 0, mode = 0, mpty = 0;
+    char strict_rejects_state_six[] = "+CLCC: 1,1,6,0,0,\"+79958528857";
+    char* strict_number = NULL;
+    unsigned strict_state = 0, strict_toa = 0;
+    assert(clcc_parse_line(strict_rejects_state_six, &idx, &dir, &strict_state, &mode, &mpty,
+                           &strict_number, &strict_toa) == -1);
+
     char incoming[] = "+CLCC: 1,1,6,0,0,\"+79958528857";
-    assert(clcc_parse_release_prefix(incoming, &idx, &dir, &mode, &mpty) == 0);
+    const int incoming_result = clcc_parse_release_prefix(incoming, &idx, &dir, &mode, &mpty);
+    assert(incoming_result == 0);
+    assert(clcc_parse_failure_is_error(incoming_result) == 0); /* fallback accepted => WARNING */
     assert(idx == 1 && dir == 1 && mode == 0 && mpty == 0);
 
     char outgoing[] = "+CLCC: 1,0,6,0,0,\"+79958528857";
@@ -61,9 +69,12 @@ static void test_partial_release_prefix_for_both_directions(void)
     assert(idx == 1 && dir == 0 && mode == 0 && mpty == 0);
 
     char wrong_state[] = "+CLCC: 1,1,5,0,0,\"+799";
-    assert(clcc_parse_release_prefix(wrong_state, &idx, &dir, &mode, &mpty) == -1);
+    const int rejected_result = clcc_parse_release_prefix(wrong_state, &idx, &dir, &mode, &mpty);
+    assert(rejected_result == -1);
+    assert(clcc_parse_failure_is_error(rejected_result) == 1); /* fallback отказал => ERROR */
     char wrong_type[] = "+CLCC: 1,1,6,1,0,\"+799";
-    assert(clcc_parse_release_prefix(wrong_type, &idx, &dir, &mode, &mpty) == -1);
+    const int wrong_type_result = clcc_parse_release_prefix(wrong_type, &idx, &dir, &mode, &mpty);
+    assert(wrong_type_result == -1 && clcc_parse_failure_is_error(wrong_type_result) == 1);
     char malformed_identity[] = "+CLCC: 1junk,1,6,0,0,\"+799";
     assert(clcc_parse_release_prefix(malformed_identity, &idx, &dir, &mode, &mpty) == -1);
     char zero_idx[] = "+CLCC: 0,1,6,0,0,\"+799";

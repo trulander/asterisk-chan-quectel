@@ -90,6 +90,15 @@ int clcc_parse_line(char* line, unsigned* call_idx, unsigned* dir, unsigned* sta
     return 0;
 }
 
+/** Сопоставить результат fallback с уровнем журнала strict parse failure.
+ * Результат release-prefix parser равен 0 только для допустимой partial RELEASED
+ * identity; это значение должно предупреждаться, любой отказ — логироваться как ошибка.
+ */
+int clcc_parse_failure_is_error(int release_prefix_result)
+{
+    return release_prefix_result != 0;
+}
+
 /** Принимать только однозначную identity-часть vendor CLCC release status.
  * Номер может быть оборван после запятой/кавычки; он не влияет на выбор текущего
  * call_idx, но текущий release всё равно требует следующего полного snapshot barrier.

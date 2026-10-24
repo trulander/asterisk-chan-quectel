@@ -20,6 +20,21 @@ struct call_page_row {
 typedef int (*call_page_cb)(void*, const struct call_page_row*);
 /** Сосчитать строки только указанной SIM; db и выходной total принадлежат caller. Ошибка SQL возвращает -1. */
 int call_paging_count(sqlite3* db, const char* device, int* total);
+/** Вычислить UTC duration в `Dд HH:MM:SS`.
+ * Входы должны иметь точный формат `YYYY-MM-DD HH:MM:SS UTC`; отсутствующие,
+ * невозможные, переполненные даты и end раньше start дают -1 и пустой output.
+ * Нулевой интервал допустим. Функция не меняет данные и предназначена для HTML,
+ * поэтому длительность не добавляется в SQL/JSON schema.
+ */
+int call_paging_duration(const char* started_at, const char* ended_at, char* output, size_t output_size);
+/** Собрать точный HTML-фрагмент заголовка или ячейки Duration для renderer-а.
+ * header!=0 создаёт `<th>Duration</th>`; иначе выдаёт рассчитанную ячейку либо
+ * `<td>&mdash;</td>` при отсутствующей/некорректной дате. В output не попадают
+ * исходные данные пользователя, только вычисленный текст и фиксированная разметка.
+ * Возвращает 0 при полном фрагменте, -1 при неверном output/недостатке ёмкости.
+ */
+int call_paging_html_duration_fragment(int header, const char* started_at, const char* ended_at,
+                                       char* output, size_t output_size);
 /** Выдать страницу в порядке started_at/id DESC; callback получает временную row copy: 0 продолжает, nonzero прерывает обход успешно (pager возвращает 0). Callback-specific failure caller должен сохранить отдельно в ctx и проверить после возврата pager; ошибки SQL возвращают -1. */
 int call_paging_page(sqlite3* db, const char* device, int limit, int offset, void* ctx, call_page_cb cb);
 #endif
